@@ -1,0 +1,34 @@
+# Ingress for Board (ingress-nginx example).
+#
+# WebSockets: ingress-nginx upgrades connections automatically. The only thing
+# you usually must raise is the proxy read/send timeout, otherwise idle boards
+# get their socket cut after the default 60s.
+#
+# TLS: a WebSocket to wss:// requires HTTPS on the same host. The cert-manager
+# annotation below is optional; remove it if you terminate TLS elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: board
+  namespace: board
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - board.example.com
+      secretName: board-tls
+  rules:
+    - host: board.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: board
+                port:
+                  number: 80

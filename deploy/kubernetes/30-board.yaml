@@ -1,0 +1,101 @@
+# Board application: Deployment + Service.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SCALING CAVEAT — READ THIS BEFORE RAISING `replicas`.
+#
+# Board keeps all live room state IN MEMORY inside a single process (the Hub's
+# `rooms` map) and broadcasts moves only to the WebSocket connections held by
+# THAT process. There is no shared pub/sub (no Redis) and no cross-pod
+# coordination. The database is used only for periodic snapshot save/load.
+#
+# Therefore, with more than one replica, two users who land on different pods
+# for the SAME board get two divergent in-memory rooms and never see each
+# other's moves.
+#
+# Options:
+#   1. replicas: 1  (default, correct for the vast majority of deployments).
+#   2. Scale out ONLY with board-affinity routing at the Ingress: consistent
+#      hashing on the request path (which contains /b/{boardID} and
+#      /socket/b/{boardID}) so every connection for a given board always lands
+#      on the same pod. See docs/kubernetes.md ("Scaling horizontally").
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: board
+  namespace: board
+  labels:
+    app.kubernetes.io/name: board
+spec:
+  replicas: 1 # see SCALING CAVEAT above before changing
+  strategy:
+    # Board holds long-lived WebSockets and only snapshots to the DB on
+    # shutdown/heartbeat. Recreate avoids two pods briefly owning the same
+    # board during a rollout. Use RollingUpdate only with board-affinity routing.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: board
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: board
+    spec:
+      # Give the pod time to snapshot rooms to the DB on SIGTERM before it is
+      # killed. main() catches SIGTERM/SIGINT and runs Hub.Save() on the way out.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: board
+          image: ghcr.io/golab/board:latest # replace with your built/pushed image
+          args: ["-f", "/etc/board/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: config
+              mountPath: /etc/board
+              readOnly: true
+          readinessProbe:
+            httpGet:
+              path: /api/ping
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: false # image builds/runs as root; see docs to harden
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: config
+          secret:
+            secretName: board-config # contains config.yaml (with the DB DSN)
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: board
+  namespace: board
+  labels:
+    app.kubernetes.io/name: board
+spec:
+  selector:
+    app.kubernetes.io/name: board
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

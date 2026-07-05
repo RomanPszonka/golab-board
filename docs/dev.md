@@ -2,7 +2,9 @@
 
 For additional documentation, see:
 - The [design doc](design.md)
-- The [API v1 spec](apiv1.md)
+- The [full API reference](api.md) (HTTP + WebSocket) and the machine-readable [OpenAPI spec](openapi.yaml)
+- The [API v1 spec](apiv1.md) (concise REST event list)
+- The [Kubernetes deployment guide](kubernetes.md) and ready-to-apply [manifests](../deploy/kubernetes)
 
 ## Quickstart
 
