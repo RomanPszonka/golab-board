@@ -35,6 +35,12 @@ A free and open-source multi-user go board.
 - Free and open source
 - Open license [asset pack](https://github.com/golab/board/raw/refs/heads/test/assets/assets.zip) (board and white stones)
 
+## Documentation
+- [Developer guide](docs/dev.md) — build, run, test, contribute.
+- [API reference](docs/api.md) — full HTTP + WebSocket API, plus a machine-readable [OpenAPI spec](docs/openapi.yaml).
+- [Kubernetes deployment guide](docs/kubernetes.md) — deploy and integrate Board on a cluster, with ready-to-apply [manifests](deploy/kubernetes).
+- [Design doc](docs/design.md) — project layout and package boundaries.
+
 ## Contributing
 - Report bugs or suggest features on [Discord](https://discord.gg/y4wGZyed3e), or open [an issue](https://github.com/golab/board/issues/new) on GitHub.
 - Developers: see the [dev docs](docs/dev.md) for details on contributing code.

@@ -1,0 +1,485 @@
+openapi: 3.1.0
+info:
+  title: Board API
+  version: v1
+  description: >
+    HTTP surface of Board, a free and open-source multi-user Go board.
+
+
+    The interactive, real-time surface is a WebSocket at
+    `/socket/b/{boardID}` and is NOT modeled here (OpenAPI does not describe
+    WebSocket message framing well); see docs/api.md for the WebSocket protocol.
+    This document covers the REST, service, export, and web/Twitch HTTP routes.
+
+
+    The REST API is a single endpoint whose behavior is a discriminated union
+    over the `event` field of the request body — see the `EventBody` schema.
+  license:
+    name: MIT
+    url: https://github.com/golab/board/blob/main/LICENSE
+servers:
+  - url: https://board.example.com
+    description: Your deployment
+  - url: http://localhost:8080
+    description: Local dev
+
+tags:
+  - name: rest
+    description: REST API v1 — run one event against a board.
+  - name: service
+    description: Health and introspection.
+  - name: export
+    description: SGF export and debug dumps.
+  - name: web
+    description: HTML pages and helper redirects.
+  - name: twitch
+    description: Twitch OAuth + EventSub (only when Twitch is configured).
+
+paths:
+  /api/v1/room/{boardID}:
+    post:
+      tags: [rest]
+      summary: Run an event against a board
+      description: >
+        Executes a single event against the room `boardID` (created on demand)
+        and returns the resulting event. "Success" means the event was received
+        and interpreted, not necessarily that the board changed.
+      operationId: postRoomEvent
+      parameters:
+        - $ref: '#/components/parameters/BoardID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBody'
+            examples:
+              addStone:
+                summary: Play a black stone at (3,3)
+                value: { event: add_stone, value: { coords: [3, 3], color: 1 } }
+              isProtected:
+                summary: Ask whether the room has a password
+                value: { event: isprotected }
+              uploadSgf:
+                summary: Load a base64-encoded SGF
+                value: { event: upload_sgf, value: "KDsjRls7...==" }
+              requestSgf:
+                summary: Load an allow-listed SGF URL
+                value: { event: request_sgf, value: "https://online-go.com/api/v1/reviews/12345/sgf" }
+      responses:
+        '200':
+          description: Event received and interpreted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessResponse'
+              examples:
+                frame:
+                  summary: Event produced a new board frame
+                  value:
+                    success: true
+                    output: { event: frame, value: { }, userid: "", eventid: "b1c2..." }
+        '400':
+          description: Malformed body, unknown event type, or handler error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/ping:
+    get:
+      tags: [service]
+      summary: Liveness probe
+      operationId: getPing
+      responses:
+        '200':
+          description: Always pong.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+              example: { message: pong }
+
+  /api/version:
+    get:
+      tags: [service]
+      summary: Build version
+      operationId: getVersion
+      responses:
+        '200':
+          description: The build's git tag (or "dev").
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+              example: { message: v1.2.3 }
+
+  /api/stats:
+    get:
+      tags: [service]
+      summary: Live room & connection counts
+      operationId: getStats
+      responses:
+        '200':
+          description: Current counts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Stats'
+              example: { rooms: 4, connections: 11 }
+
+  /b/{boardID}/sgf:
+    get:
+      tags: [export]
+      summary: Export the board as SGF
+      operationId: getSgf
+      parameters:
+        - $ref: '#/components/parameters/BoardID'
+      responses:
+        '200':
+          description: SGF document (empty body if the room does not exist).
+          content:
+            text/plain: { schema: { type: string } }
+
+  /b/{boardID}/sgfix:
+    get:
+      tags: [export]
+      summary: Export the board as SGF with node indexes
+      operationId: getSgfix
+      parameters:
+        - $ref: '#/components/parameters/BoardID'
+      responses:
+        '200':
+          description: SGF document with indexes.
+          content:
+            text/plain: { schema: { type: string } }
+
+  /b/{boardID}/debug:
+    get:
+      tags: [export]
+      summary: Dump internal room state (debugging)
+      operationId: getDebug
+      parameters:
+        - $ref: '#/components/parameters/BoardID'
+      responses:
+        '200':
+          description: JSON dump of the room's internal state.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+
+  /new:
+    post:
+      tags: [web]
+      summary: Create a board and redirect to it
+      operationId: postNew
+      requestBody:
+        required: false
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                board_id:
+                  type: string
+                  description: Desired ID; blank generates a random adjective-color-animal name.
+      responses:
+        '302':
+          description: Redirect to /b/{boardID}.
+          headers:
+            Location: { schema: { type: string } }
+
+  /ext/upload:
+    get:
+      tags: [web]
+      summary: Load an SGF URL into a board and redirect
+      operationId: getExtUpload
+      parameters:
+        - in: query
+          name: url
+          required: true
+          schema: { type: string }
+          description: SGF URL to fetch (subject to the server's allow-list).
+        - in: query
+          name: board_id
+          required: false
+          schema: { type: string }
+          description: Target board; blank generates a random name.
+      responses:
+        '302':
+          description: Redirect to /b/{boardID}.
+        '400':
+          description: Missing url.
+
+  /apps/twitch/callback:
+    post:
+      tags: [twitch]
+      summary: Twitch EventSub webhook
+      description: >
+        Receives Twitch EventSub notifications. Verifies the HMAC signature,
+        answers subscription challenges, and handles the `!setboard` and
+        `!branch` chat commands. Only active when Twitch is configured.
+      operationId: postTwitchCallback
+      responses:
+        '200':
+          description: Processed (or challenge echoed).
+        '403':
+          description: Signature/state verification failed.
+
+components:
+  parameters:
+    BoardID:
+      in: path
+      name: boardID
+      required: true
+      description: Room identifier. Lowercased and stripped to [a-z0-9-].
+      schema:
+        type: string
+        example: demo
+
+  schemas:
+    Message:
+      type: object
+      properties:
+        message: { type: string }
+      required: [message]
+
+    Stats:
+      type: object
+      properties:
+        rooms: { type: integer, description: Number of live rooms. }
+        connections: { type: integer, description: Total live WebSocket connections. }
+      required: [rooms, connections]
+
+    Coord:
+      type: array
+      description: "[x, y] 0-indexed from top-left."
+      minItems: 2
+      maxItems: 2
+      items: { type: integer }
+      example: [9, 9]
+
+    Color:
+      type: integer
+      description: 1 = black, 2 = white.
+      enum: [1, 2]
+
+    Event:
+      type: object
+      description: Canonical event envelope used on both REST and WebSocket.
+      properties:
+        event: { type: string }
+        value: {}
+        userid:
+          type: string
+          description: Originating connection ID; set by the server.
+        eventid:
+          type: string
+          description: Correlation ID; assigned by the server if omitted.
+      required: [event]
+
+    SuccessResponse:
+      type: object
+      properties:
+        success: { type: boolean, enum: [true] }
+        output:
+          $ref: '#/components/schemas/Event'
+      required: [success, output]
+
+    ErrorResponse:
+      type: object
+      properties:
+        success: { type: boolean, enum: [false] }
+        error: { type: string }
+      required: [success, error]
+
+    # The request body of POST /api/v1/room/{boardID}. Its meaning is a
+    # discriminated union over `event`. Kept in sync with
+    # pkg/state/command_decoder.go and pkg/room/handlers.go.
+    EventBody:
+      oneOf:
+        # --- session / room control ---
+        - title: isprotected
+          type: object
+          properties: { event: { const: isprotected } }
+          required: [event]
+        - title: checkpassword
+          type: object
+          properties:
+            event: { const: checkpassword }
+            value: { type: string, description: The password to check. }
+          required: [event, value]
+        - title: ping
+          type: object
+          properties: { event: { const: ping } }
+          required: [event]
+        - title: debug
+          type: object
+          properties: { event: { const: debug } }
+          required: [event]
+        - title: update_nickname
+          type: object
+          properties:
+            event: { const: update_nickname }
+            value: { type: string }
+          required: [event, value]
+        - title: update_settings
+          type: object
+          properties:
+            event: { const: update_settings }
+            value:
+              type: object
+              properties:
+                buffer: { type: integer, description: Input debounce (ms). }
+                size: { type: integer, enum: [9, 13, 19] }
+                nickname: { type: string }
+                black: { type: string, description: SGF PB; "" leaves unchanged. }
+                white: { type: string, description: SGF PW; "" leaves unchanged. }
+                komi: { type: string, description: SGF KM; "" leaves unchanged. }
+                password: { type: string, description: '"" clears; non-empty sets and bcrypt-hashes.' }
+              required: [buffer, size, nickname, black, white, komi, password]
+          required: [event, value]
+        - title: trash
+          type: object
+          properties: { event: { const: trash } }
+          required: [event]
+        # --- loading games ---
+        - title: upload_sgf
+          type: object
+          properties:
+            event: { const: upload_sgf }
+            value:
+              oneOf:
+                - { type: string, description: base64-encoded SGF/GIB/NGF/ZIP (<=1MB decoded). }
+                - { type: array, items: { type: string }, description: Array of base64 files to merge. }
+          required: [event, value]
+        - title: request_sgf
+          type: object
+          properties:
+            event: { const: request_sgf }
+            value: { type: string, format: uri, description: Allow-listed SGF URL (OGS game/review/demo recognized). }
+          required: [event, value]
+        # --- placing & marking ---
+        - title: add_stone
+          type: object
+          properties:
+            event: { const: add_stone }
+            value:
+              type: object
+              properties:
+                coords: { $ref: '#/components/schemas/Coord' }
+                color: { $ref: '#/components/schemas/Color' }
+              required: [coords, color]
+          required: [event, value]
+        - title: pass
+          type: object
+          properties:
+            event: { const: pass }
+            value: { $ref: '#/components/schemas/Color' }
+          required: [event, value]
+        - title: remove_stone
+          type: object
+          properties:
+            event: { const: remove_stone }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        - title: triangle
+          type: object
+          properties:
+            event: { const: triangle }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        - title: square
+          type: object
+          properties:
+            event: { const: square }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        - title: letter
+          type: object
+          properties:
+            event: { const: letter }
+            value:
+              type: object
+              properties:
+                coords: { $ref: '#/components/schemas/Coord' }
+                letter: { type: string }
+              required: [coords, letter]
+          required: [event, value]
+        - title: number
+          type: object
+          properties:
+            event: { const: number }
+            value:
+              type: object
+              properties:
+                coords: { $ref: '#/components/schemas/Coord' }
+                number: { type: integer }
+              required: [coords, number]
+          required: [event, value]
+        - title: label
+          type: object
+          properties:
+            event: { const: label }
+            value:
+              type: object
+              properties:
+                coords: { $ref: '#/components/schemas/Coord' }
+                label: { type: string }
+              required: [coords, label]
+          required: [event, value]
+        - title: remove_mark
+          type: object
+          properties:
+            event: { const: remove_mark }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        - title: markdead
+          type: object
+          properties:
+            event: { const: markdead }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        # --- navigation & tree ---
+        - title: navigation (left/right/up/down/rewind/fastforward/cut/erase_pen/copy/clipboard/score)
+          type: object
+          properties:
+            event:
+              type: string
+              enum: [left, right, up, down, rewind, fastforward, cut, erase_pen, copy, clipboard, score]
+          required: [event]
+        - title: goto_grid
+          type: object
+          properties:
+            event: { const: goto_grid }
+            value: { type: integer }
+          required: [event, value]
+        - title: goto_coord
+          type: object
+          properties:
+            event: { const: goto_coord }
+            value: { $ref: '#/components/schemas/Coord' }
+          required: [event, value]
+        - title: graft
+          type: object
+          properties:
+            event: { const: graft }
+            value: { type: string }
+          required: [event, value]
+        # --- annotation ---
+        - title: comment
+          type: object
+          properties:
+            event: { const: comment }
+            value: { type: string }
+          required: [event, value]
+        - title: draw
+          type: object
+          properties:
+            event: { const: draw }
+            value:
+              type: array
+              description: "[x0, y0, x1, y1, colorHex]; x0/y0 may be null for stroke start."
+              items: {}
+              minItems: 5
+              maxItems: 5
+          required: [event, value]

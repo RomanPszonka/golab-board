@@ -1,0 +1,37 @@
+# Runtime configuration for Board.
+#
+# IMPORTANT: the binary reads configuration ONLY from the YAML file passed with
+# `-f` (see pkg/config/config.go -> config.New). There is no environment-variable
+# override in the code today. Because the Postgres DSN and Twitch credentials are
+# secret and must live inside that same file, the entire config.yaml is stored in
+# a Secret rather than split across a ConfigMap + Secret.
+#
+# Prefer generating this Secret from a SealedSecret / ExternalSecret / SOPS in a
+# real cluster instead of committing plaintext. Values below are placeholders.
+#
+# Full schema: pkg/config/config.go
+apiVersion: v1
+kind: Secret
+metadata:
+  name: board-config
+  namespace: board
+type: Opaque
+stringData:
+  config.yaml: |
+    mode: prod
+    server:
+      host: 0.0.0.0
+      port: 8080
+      # Public, externally reachable URL. Only used to build Twitch OAuth
+      # redirect + EventSub callback URLs. Not required for core board play.
+      url: https://board.example.com
+    db:
+      type: postgres
+      path: "postgres://board:CHANGE_ME@postgres.board.svc.cluster.local:5432/board?sslmode=disable"
+    # Optional. Leave the three fields empty/absent to disable Twitch entirely
+    # (TwitchEnabled() returns false; the /integrations page renders the
+    # "disabled" variant). All three must be set for Twitch to activate.
+    twitch:
+      client_id: ""
+      secret: ""
+      bot_id: ""
