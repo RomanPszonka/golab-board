@@ -3,7 +3,37 @@
 **Target:** `golab-board` (multi-user Go board web application)
 **Assessment date:** 2026-07-07
 **Scope:** Full source review of the Go backend (~10k LOC): HTTP/WebSocket routing, event handling, file-format parsers (SGF/GIB/NGF/ZIP), room/state management, OGS and Twitch integrations, persistence layer, and deployment configuration.
-**Method:** Manual source-code audit (white-box). No live/dynamic testing was performed against a running instance.
+**Method:** Manual source-code audit (white-box), **followed by dynamic proof-of-concept validation** against a locally-run instance. Runnable PoCs for every Critical and High finding are in [`security/poc/`](security/poc/); §0 records what validation confirmed and corrected.
+
+---
+
+## 0. PoC validation results (2026-07-07)
+
+After the initial static review, every Critical and High finding was exercised with a proof-of-concept ([`security/poc/`](security/poc/)). Validation **corrected several severities** — most importantly, it disproved the original headline claim that panics crash the whole server. Read this section before acting on the ratings below.
+
+**Key correction — Go's `net/http` recovers request-goroutine panics.** The board's WebSocket handler (`golang.org/x/net/websocket`) and the HTTP API both run their work *inside the HTTP request goroutine*, which `net/http` wraps in a `recover()`. Empirically, the unchecked-type-assertion panics (C-1, C-2, C-7's panic) fire but are caught (`http: panic serving …`): they drop the **single offending connection** and spam logs — they do **not** crash the process. They are reclassified from Critical to **Medium**. (They *would* be fatal if reached from a spawned goroutine — see M-6/OGS and the heartbeat.)
+
+**The genuine unauthenticated whole-server crashes** are the ones that bypass `recover()`:
+
+| Finding | What was proven end-to-end | Result |
+|---------|----------------------------|--------|
+| **C-6** stack overflow (SGF parse) | `POST /api/v1/room/{id}` with `{"event":"upload_sgf","value":["<b64 of '(' ×12,000,000>"]}` → `fatal error: stack overflow`, process dead | **Confirmed — whole-server crash, unauthenticated** |
+| **H-7** stack overflow (`toSGF`) | same request with **two** list entries → trace shows `(*SGFNode).toSGF`, process dead | **Confirmed — elevated to Critical** |
+| **C-3** board-size OOM | one unauthenticated request with `size:20000` grew server RSS 80 MB → 626 MB and retained it; `size:200000` (~320 GB) OOM-kills | **Confirmed** |
+| **C-5** zip bomb | `internal/zip.Decompress` returned **536 MB from a 510 KB** archive | **Confirmed** |
+| **C-2** GIB index panic | `alphabet[25]` panics (`index out of range [25] with length 19`) | **Confirmed, but recovered → Medium** |
+| **C-1 / C-7 panic** | `interface conversion: string, not map` — but caught by `net/http` | **Recovered → Medium; C-7 stays Critical for unauth *control* + crash delivery** |
+| **H-1** CSWSH | cross-origin socket accepted, initial board frame received | **Confirmed** |
+| **H-2** room flood | rooms grew 1 → 501 from junk connections | **Confirmed** |
+| **H-3** connection flood | 1000 concurrent connections, no cap/throttle | **Confirmed** |
+| **H-5** Twitch bypass | forged webhook with an **invalid** signature returned `200 OK` (empty secret) | **Confirmed** |
+| **H-6** NGF/SGF board OOM | `state.FromSGF` rejects `SZ[50000]` (“unsupported board size”); NGF parser never allocates on size | **False positive — mitigated; dropped** |
+| **C-4** “instant 4 GB” | `readBytes` grows incrementally, not pre-allocated | **Mechanism corrected → High (no max message size + no read deadline)** |
+
+**Two important delivery details validation surfaced:**
+
+1. **The 1 MB upload cap is bypassable.** `handleUploadSGF` caps the decoded size at 1 MiB **only** on the string branch. The **array branch** (`value` as a JSON list) has **no cap** and feeds `parser.Merge` → the parser/serializer. This is what makes C-6/H-7 exploitable at crash-scale.
+2. **`recover()` is still worth adding** — not for the request path (net/http already covers it) but for the **spawned goroutines** (OGS plugin loop, heartbeat, message loop), where an unchecked assertion *is* an unrecovered whole-process crash.
 
 ---
 
@@ -11,29 +41,34 @@
 
 The application is a no-login, no-signup collaborative Go board. Any anonymous client can open a WebSocket, create rooms, upload files, and drive board state. This is a large, fully **unauthenticated attack surface**, and the codebase currently trusts client input in many places where it should not.
 
-The single most important structural weakness is that **there is no `recover()` anywhere in the process, and per-connection work runs in goroutines that make many unchecked assumptions about client input.** In Go, an unrecovered panic in *any* goroutine terminates the *entire* process. As a result, a large number of individually small bugs (unchecked type assertions, out-of-range slice indexing, unbounded recursion) each escalate into a **single-request, unauthenticated, whole-server crash (DoS)**. Several of these are trivially triggerable by anyone who can reach the service.
+The most serious *validated* problems are **unauthenticated whole-server crashes** that a single request triggers and that Go's `recover()` cannot stop: **unbounded recursion** in the SGF parser and tree serializer (C-6, H-7 — a `fatal error: stack overflow`) and **unbounded memory allocation** (C-3 board size, C-5 zip bomb — OOM). All are reachable through the uncapped `upload_sgf` array branch and the unauthenticated `POST /api/v1/room/{board}` endpoint. These were reproduced end-to-end (see §0).
 
-Alongside the crash bugs, there are multiple **memory-exhaustion** vectors (attacker-controlled allocation sizes with no caps), missing WebSocket **origin validation** (cross-site WebSocket hijacking), unbounded **room/connection creation**, and a **Twitch webhook authentication bypass** when the signing secret is unset.
+A second class of bugs — unchecked type assertions that panic (C-1, C-2, C-7) — is real but **contained by `net/http`'s per-request `recover()`**: each drops one connection rather than the server. They matter for robustness and become fatal in spawned goroutines, but they are not the emergency the raw code smell suggests.
 
-None of the findings are theoretical-only; most are reachable by an unauthenticated remote attacker. Before exposing this on a public website, the items in [§3 Critical](#3-critical-findings) and [§4 High](#4-high-findings) should be remediated, and the deployment hardening in [§7](#7-deployment--configuration-hardening) applied.
+Alongside these, there are missing WebSocket **origin validation** (cross-site WebSocket hijacking, H-1), unbounded **room/connection creation** (H-2/H-3), no **timeouts** (slow-loris, H-4/C-4/M-1), and a **Twitch webhook authentication bypass** when the signing secret is unset (H-5) — all validated.
 
-### Severity counts
+Before exposing this on a public website, the items in [§3 Critical](#3-critical-findings) and [§4 High](#4-high-findings) should be remediated, and the deployment hardening in [§7](#7-deployment--configuration-hardening) applied.
 
-| Severity | Count |
-|----------|-------|
-| Critical | 7 |
-| High | 7 |
-| Medium | 8 |
-| Low / Hardening | 9 |
+### Severity counts (post-validation)
+
+| Severity | Count | IDs |
+|----------|-------|-----|
+| Critical | 5 | C-3, C-5, C-6, C-7, H-7 |
+| High | 6 | C-4, H-1, H-2, H-3, H-4, H-5 |
+| Medium | 10 | C-1, C-2, M-1 … M-8 |
+| Low / Hardening | 9 | L-1 … L-9 |
+| Mitigated / dropped | — | H-6 |
+
+> IDs keep their original labels (C-#, H-#) for traceability even where validation changed the severity; the level is stated on each finding.
 
 ### Highest-priority fixes (do these first)
 
-1. **Add panic recovery** around every per-connection / per-request handler goroutine, *and* replace unchecked type assertions with comma-ok checks (C-1). This alone neutralizes a whole class of remote crashes.
-2. **Cap all attacker-controlled allocation sizes**: WebSocket frame length (C-4), board size (C-3), ZIP output (C-5), NGF/SGF board size (H-6).
-3. **Bound recursion depth** in the SGF parser and tree operations (C-6, H-7).
-4. **Bounds-check GIB coordinates** before indexing (C-2).
-5. **Authenticate/limit the HTTP `/api/v1/room/{board}` endpoint** and cap its body size (C-7).
-6. **Validate the WebSocket `Origin`** header (H-1) and **fail-closed on an empty Twitch secret** (H-5).
+1. **Bound recursion depth** in the SGF parser (`parseBranch`) and the tree serializer (`toSGF`/`Copy`) — this closes the two confirmed whole-server crashes (C-6, H-7).
+2. **Cap the `upload_sgf` array branch** to the same 1 MiB limit as the string branch (removes the crash-scale delivery path), and **cap all attacker-controlled allocation sizes**: board size (C-3), ZIP output + entry count (C-5), WebSocket message size (C-4).
+3. **Authenticate/limit `POST /api/v1/room/{board}`** and wrap its body in `http.MaxBytesReader` (C-7) — it is the unauthenticated delivery vector for the above.
+4. **Validate the WebSocket `Origin`** header (H-1) and add **connection/room caps + rate limiting** (H-2, H-3) and **read/HTTP timeouts** (H-4, C-4, M-1).
+5. **Fail-closed on an empty Twitch secret** (H-5).
+6. **Replace unchecked type assertions with comma-ok checks** and add `recover()` to spawned goroutines (C-1, C-2, M-6) — lower urgency (net/http already contains the request-path panics) but removes latent crashes and log spam.
 
 ---
 
@@ -41,20 +76,21 @@ None of the findings are theoretical-only; most are reachable by an unauthentica
 
 | ID | Severity | Title | Location |
 |----|----------|-------|----------|
-| C-1 | Critical | Unrecovered panics crash the whole server (unchecked type assertions) | `pkg/room/handlers.go`, process-wide |
-| C-2 | Critical | Index-out-of-range panic on malformed GIB coordinates | `pkg/core/parser/gibparser.go:280` |
-| C-3 | Critical | Board-size memory exhaustion via `update_settings` | `pkg/room/handlers.go:243`, `pkg/core/board/board.go:61` |
-| C-4 | Critical | Unbounded WebSocket frame allocation (~4 GB) | `pkg/event/channel.go:88-126` |
-| C-5 | Critical | ZIP bomb — unbounded in-memory decompression | `internal/zip/zip.go:37-46` |
-| C-6 | Critical | Stack overflow via deeply nested SGF (unbounded recursion) | `pkg/core/parser/sgfparser.go:214-255` |
-| C-7 | Critical | Unauthenticated state manipulation + crash via HTTP API | `pkg/hub/apiv1router.go` |
-| H-1 | High | No WebSocket Origin check → cross-site WebSocket hijacking (CSWSH) | `pkg/hub/socketrouter.go:35-43` |
-| H-2 | High | Unbounded room creation → resource exhaustion | `pkg/hub/hub.go:275-291` |
-| H-3 | High | No connection limits / rate limiting | `pkg/hub/hub.go`, `socketrouter.go` |
+| C-6 | **Critical** | Stack overflow via deeply nested SGF (unbounded recursion) — **validated whole-server crash** | `pkg/core/parser/sgfparser.go:214-255` |
+| H-7 | **Critical** (was High) | Stack overflow in tree `toSGF`/`Copy` recursion — **validated whole-server crash** | `pkg/core/parser/parser.go:51-83`, `pkg/core/tree/tree.go:149-170` |
+| C-3 | **Critical** | Board-size memory exhaustion via `update_settings` — **validated (RSS 80→626 MB)** | `pkg/room/handlers.go:243`, `pkg/core/board/board.go:61` |
+| C-5 | **Critical** | ZIP bomb — unbounded in-memory decompression — **validated (536 MB from 510 KB)** | `internal/zip/zip.go:37-46` |
+| C-7 | **Critical** | Unauthenticated state control + crash delivery via HTTP API | `pkg/hub/apiv1router.go` |
+| C-4 | High (was Critical) | No max WebSocket message size + no read deadline (unbounded buffering / slow-loris) | `pkg/event/channel.go:88-126` |
+| H-1 | High | No WebSocket Origin check → cross-site WebSocket hijacking (CSWSH) — **validated** | `pkg/hub/socketrouter.go:35-43` |
+| H-2 | High | Unbounded room creation → resource exhaustion — **validated (1→501)** | `pkg/hub/hub.go:275-291` |
+| H-3 | High | No connection limits / rate limiting — **validated (1000 conns)** | `pkg/hub/hub.go`, `socketrouter.go` |
 | H-4 | High | No WebSocket read timeout → slow-loris | `pkg/event/channel.go` |
-| H-5 | High | Twitch webhook HMAC bypass when secret is empty | `internal/twitch/twitch.go:72-82` |
-| H-6 | High | Unbounded board size from NGF/SGF → OOM | `pkg/core/parser/ngfparser.go:122` |
-| H-7 | High | Stack overflow in tree `Copy`/`toSGF` recursion | `pkg/core/tree/tree.go:149-170` |
+| H-5 | High | Twitch webhook HMAC bypass when secret is empty — **validated (200 to bad sig)** | `internal/twitch/twitch.go:72-82` |
+| C-1 | Medium (was Critical) | `update_settings` type-assertion panic — **recovered by net/http** (per-connection DoS) | `pkg/room/handlers.go` |
+| C-2 | Medium (was Critical) | GIB coordinate index panic — **recovered by net/http** via upload path | `pkg/core/parser/gibparser.go:280` |
+| H-6 | ~~High~~ **Mitigated** | Board size from NGF/SGF — `state.FromSGF` clamps `size>19`; **not exploitable** (see C-3) | `pkg/core/parser/ngfparser.go:122` |
+| **Uncapped array branch** | High | `upload_sgf` array branch skips the 1 MiB cap — the crash-scale delivery path for C-6/H-7 | `pkg/room/handlers.go:150-170` |
 | M-1 | Medium | No HTTP server timeouts → slow-loris at HTTP layer | `cmd/main.go:79` |
 | M-2 | Medium | Unbounded HTTP request body | `pkg/hub/apiv1router.go` |
 | M-3 | Medium | `/debug` endpoint leaks full room state unauthenticated | `pkg/hub/webrouter.go` |
@@ -77,11 +113,13 @@ None of the findings are theoretical-only; most are reachable by an unauthentica
 
 ## 3. Critical findings
 
-### C-1. Unrecovered panics crash the whole server
+> The detailed write-ups below keep their original IDs. Where validation changed a rating (§0), the corrected severity is stamped at the top of the entry. C-1 and C-2 remain in this section for traceability but are **Medium** post-validation.
 
-**Locations:** `pkg/room/room.go:454` (`Handle` loop → `HandleAny`), `pkg/room/handlers.go` (multiple), process-wide (`grep -r "recover()"` returns nothing).
+### C-1. Type-assertion panics in handlers  ·  **Corrected: Medium (recovered by net/http), not a whole-server crash**
 
-Each WebSocket connection is serviced by its own goroutine that loops on `HandleAny(evt)` with **no `recover()`** anywhere in the call chain. In Go, an unrecovered panic in any goroutine terminates the entire process — so a panic triggered by one malicious client drops **all** rooms and **all** connected users, and the server exits.
+> **Validation result:** the panic fires as described, **but** it occurs in the HTTP/WebSocket request goroutine, which Go's `net/http` server wraps in `recover()`. Observed: `http: panic serving 127.0.0.1:…: interface conversion: interface {} is string, not map[string]interface {}` — the connection is dropped, the **server keeps running**. Impact is therefore a per-connection DoS + log spam, not a process crash. The fix below still matters: the *same* unchecked assertions are an unrecovered whole-process crash when reached from a spawned goroutine (see M-6, OGS plugin loop; and the heartbeat / message-loop goroutines).
+
+**Locations:** `pkg/room/room.go:454` (`Handle` loop → `HandleAny`), `pkg/room/handlers.go` (multiple). Note there is **no `recover()`** anywhere in the codebase, so the spawned-goroutine paths are unprotected.
 
 The handlers make numerous **unchecked type assertions** on attacker-controlled JSON, each of which panics on a mismatched type. Examples:
 
@@ -108,7 +146,9 @@ Recovery is defense-in-depth; the type checks are the real fix. Do both.
 
 ---
 
-### C-2. Index-out-of-range panic on malformed GIB coordinates
+### C-2. Index-out-of-range panic on malformed GIB coordinates  ·  **Corrected: Medium (recovered by net/http)**
+
+> **Validation result:** the panic is confirmed (`index out of range [25] with length 19`), but via an upload it runs in the request goroutine and is recovered by `net/http`, exactly like C-1 — one connection dies, the server survives. Still fix it (it is a fatal crash if the GIB is ever parsed from a spawned goroutine, and it's plain incorrect).
 
 **Location:** `pkg/core/parser/gibparser.go:280` — `value := string([]byte{alphabet[x], alphabet[y]})` (`alphabet` is 19 chars).
 
@@ -122,7 +162,7 @@ STO 0 0 1 25 0
 
 makes `alphabet[25]` (or a negative index) panic. The file-type detector only needs the `\HS` prefix to route into this parser.
 
-**Impact:** Unauthenticated single-file-upload crash of the whole process (see C-1 for why a parser panic is fatal). File uploads are accepted over both the WebSocket `upload_sgf` handler and the HTTP API.
+**Impact:** Per-connection DoS (recovered) on upload; a whole-process crash only if reached from a spawned goroutine. File uploads are accepted over both the WebSocket `upload_sgf` handler and the HTTP API.
 
 **Remediation:** After parsing, bounds-check: `if x < 0 || x >= len(alphabet) || y < 0 || y >= len(alphabet) { continue }` before indexing.
 
@@ -136,32 +176,34 @@ makes `alphabet[25]` (or a negative index) panic. The file-type detector only ne
 
 A client sending `size = 100000` requests ~10 billion cells → immediate OOM / crash.
 
+> **Validation result (confirmed):** one unauthenticated `POST /api/v1/room/{id}` with `size:20000` grew the server's resident memory from ~80 MB to ~626 MB and retained it. `size:200000` (~320 GB) exhausts RAM and the process is OOM-killed — an outcome `recover()` cannot catch.
+
 **Impact:** Unauthenticated remote memory-exhaustion DoS. Reachable on any password-less room, and via the HTTP API (C-7) against any room.
 
 **Remediation:** Validate `size ∈ {9, 13, 19}` (or `1 ≤ size ≤ maxBoardSize`) in `handleUpdateSettings` before use, and defensively clamp/reject in `NewBoard`.
 
 ---
 
-### C-4. Unbounded WebSocket frame allocation (~4 GB)
+### C-4. No maximum WebSocket message size + no read deadline  ·  **Corrected: High (mechanism was mis-stated)**
 
 **Location:** `pkg/event/channel.go:88-126` (`readPacket` / `readBytes`).
 
-The wire framing reads a 4-byte little-endian length prefix that is fully client-controlled (up to `0xFFFFFFFF` ≈ 4 GB) and then reads that many bytes, with **no maximum-size check**:
+> **Validation result:** the original "single 4-byte frame → instant ~4 GB allocation" is **incorrect**. `readBytes` does *not* pre-allocate the declared length; it grows the buffer 64 bytes at a time only as bytes actually arrive. So the real defects are: (a) **no upper bound on message size** — a client can make the server buffer as much as it is willing to send, per connection, with the 1 MB upload check applied only *after* full buffering; and (b) **no read deadline** — a client can send a large length prefix then stall, pinning a goroutine and partial buffer indefinitely (this is the H-4 slow-loris).
 
 ```go
-length := binary.LittleEndian.Uint32(lengthArray)
+length := binary.LittleEndian.Uint32(lengthArray)   // client-controlled, up to 4 GiB
 if length > 1024 {
-    data, err = ec.readBytes(int(length))   // grows toward attacker-declared size
+    data, err = ec.readBytes(int(length))   // grows as data arrives, no ceiling
 } else {
     data = make([]byte, length)
 }
 ```
 
-A single 4-byte frame declaring a huge length drives a multi-GB allocation per connection. The 1 MB check in `handleUploadSGF` runs *after* this, so it does not protect the framing layer. (Additionally, the fixed-size read uses `ec.ws.Read(data)` and ignores the returned count — a short read silently trusts a partial/zeroed buffer; use `io.ReadFull`.)
+(Additionally, the fixed-size read uses `ec.ws.Read(data)` and ignores the returned count — a short read silently trusts a partial/zeroed buffer; use `io.ReadFull`.)
 
-**Impact:** Unauthenticated memory-exhaustion DoS; trivially amplified across connections.
+**Impact:** Unbounded per-connection memory buffering and goroutine/connection pinning (slow-loris); memory-exhaustion DoS when combined across many connections.
 
-**Remediation:** Reject `length > maxMessageBytes` (e.g. 1–2 MB) **before** allocating or entering `readBytes`, and close the connection on violation. Use `io.ReadFull` for both the header and the body.
+**Remediation:** Reject `length > maxMessageBytes` (e.g. 1–2 MB) **before** entering `readBytes`, close the connection on violation, and set a read deadline for assembling each message. Use `io.ReadFull` for both the header and the body.
 
 ---
 
@@ -173,21 +215,30 @@ A single 4-byte frame declaring a huge length drives a multi-GB allocation per c
 
 Note: there is no zip-slip (path-traversal) risk here because entry names are never used to write files — good — but the resource-exhaustion risk is real.
 
+> **Validation result (confirmed):** a crafted 510 KB archive (one entry of zeros) decompressed to **536 MB** in memory via `internal/zip.Decompress` — a ~1000× amplification with no cap. Scaling the entry size or count OOM-kills the process.
+
 **Impact:** Unauthenticated OOM DoS from a tiny upload.
 
 **Remediation:** Enforce a per-entry cap via `io.LimitReader(rc, maxPerFile)`, a running total-bytes budget, and a maximum entry count (reject `len(zipReader.File) > N`). Consult `file.UncompressedSize64` and reject before reading when it exceeds the budget.
 
 ---
 
-### C-6. Stack overflow via deeply nested SGF (unbounded recursion)
+### C-6. Stack overflow via deeply nested SGF (unbounded recursion)  ·  **Validated whole-server crash**
 
 **Location:** `pkg/core/parser/sgfparser.go:214-255` (`parseBranch` recurses per `(`); reachable from both the clean and dirty SGF paths.
 
-`parseBranch` calls itself for every `(` with no depth cap. An SGF file that is simply `(` repeated a few hundred thousand times overflows the goroutine stack. A Go **stack overflow is a `fatal error` that `recover()` cannot catch** — so even the C-1 recovery does not save you here.
+`parseBranch` calls itself for every `(` with no depth cap. A Go **stack overflow is a `fatal error` that `recover()` cannot catch** — so unlike the panics in C-1/C-2, `net/http` does **not** contain this; the whole process dies.
 
-**Impact:** Unauthenticated single-upload hard crash of the process.
+> **Validation result (confirmed end-to-end):** the `upload_sgf` *string* branch caps decoded input at 1 MiB, which limits `(` depth below the overflow threshold — so that path is safe. **But the array branch has no cap** (see the "Uncapped array branch" finding). This unauthenticated request killed the server with `fatal error: stack overflow`:
+> ```
+> POST /api/v1/room/{id}
+> {"event":"upload_sgf","value":["<base64 of '(' × 12,000,000>"]}
+> ```
+> Measured threshold in the server's goroutine: no crash at ~2 M frames, `fatal error: stack overflow` by ~8–12 M.
 
-**Remediation:** Thread a depth counter through `parseBranch` and error out past a hard cap (e.g. 1000), or rewrite iteratively with an explicit heap stack.
+**Impact:** Unauthenticated single-request hard crash of the entire server (all rooms, all users).
+
+**Remediation:** Thread a depth counter through `parseBranch` and error out past a hard cap (e.g. 1000), or rewrite iteratively with an explicit heap stack. **Also apply the 1 MiB cap to the array branch** (see below).
 
 ---
 
@@ -202,9 +253,11 @@ evt, err := event.EventFromJSON(data)
 evt = room.HandleAny(evt)              // arbitrary event type, no auth
 ```
 
-This endpoint lets **any unauthenticated HTTP client** create a room and dispatch **any event** to it — `update_settings`, `upload_sgf`, `graft`, board commands — with no authentication and no request-body size limit. It is a clean, scriptable trigger for every crash/exhaustion bug above (C-1, C-3, etc.) without even needing a WebSocket, and its `io.ReadAll(r.Body)` is itself an unbounded-memory vector (see M-2).
+This endpoint lets **any unauthenticated HTTP client** create a room and dispatch **any event** to it — `update_settings`, `upload_sgf`, `graft`, board commands — with no authentication and no request-body size limit. It is a clean, scriptable trigger for the exhaustion/crash bugs above without needing a WebSocket, and its `io.ReadAll(r.Body)` is itself an unbounded-memory vector (see M-2).
 
-**Impact:** Full unauthenticated control over any room's state and a one-line `curl` DoS.
+> **Validation result:** confirmed as the delivery vector for the whole-server crashes — the C-6 and H-7 array-upload bodies POSTed here killed the process. Note that a *panic*-based payload (e.g. `update_settings` with a wrong-typed value) is caught by `net/http`'s recover (server survives, one request 500s); the crashes come from the stack-overflow/OOM payloads, not the panics.
+
+**Impact:** Full unauthenticated control over any room's state, plus a one-line `curl` that delivers a whole-server crash.
 
 **Remediation:** Decide whether this API should be public at all. If yes: require authentication/authorization, wrap the body in `http.MaxBytesReader`, apply the same event-validation and panic-recovery as the WebSocket path, and rate-limit it.
 
@@ -261,21 +314,36 @@ If the Twitch secret is unset (a common misconfiguration the code silently permi
 
 **Remediation:** Fail **closed** — return `false` when `secret == ""`, and refuse to start the Twitch integration without a configured secret.
 
-### H-6. Unbounded board size from NGF/SGF → OOM
+### H-6. Board size from NGF/SGF  ·  **Mitigated — not exploitable (false positive)**
 
-**Location:** `pkg/core/parser/ngfparser.go:122` (`size, err := p.parseInt()`), flowing to `board.NewBoard`.
+**Location:** `pkg/core/parser/ngfparser.go:122` (`size, err := p.parseInt()`).
 
-The NGF board size is read from the file and never range-checked (unlike `numMoves`, which *is* bounded). An NGF whose size line is e.g. `999999999` drives an `O(size²)` allocation → OOM. (SGF clamps to `> 19` but this is a separate path.)
+> **Validation result:** the original claim that a huge NGF/SGF size reaches `board.NewBoard` and OOMs is **wrong**. The NGF parser only stores `size` as the `SZ` *string* field and never allocates on it. The only path from parsed SGF/NGF to `NewBoard` is `state.FromSGF`, which **clamps `size > 19`** (`pkg/state/state.go:196`) and returns `"unsupported board size"` before allocating — confirmed with `state.FromSGF("(;SZ[50000])")`. The genuine unclamped board-size DoS is **C-3** (`update_settings`), which does *not* go through this clamp.
 
-**Remediation:** Validate `1 ≤ size ≤ maxBoardSize` immediately after parsing, and clamp defensively in `NewBoard`.
+**Residual note (not a DoS):** `parseMove` uses `byte(size)` (`ngfparser.go:65`), which truncates for `size > 255` and yields garbage coordinates — a data-integrity nit worth a range check, not a security finding.
 
-### H-7. Stack overflow in tree `Copy`/`toSGF` recursion
+### H-7. Stack overflow in tree `toSGF`/`Copy` recursion  ·  **Validated whole-server crash (elevated to Critical)**
 
-**Location:** `pkg/core/tree/tree.go:149-170` (`Copy`), `pkg/core/parser/parser.go:51-83` (`toSGF`).
+**Location:** `pkg/core/parser/parser.go:51-83` (`SGFNode.toSGF`), `pkg/core/tree/tree.go:149-170` (`TreeNode.Copy`).
 
-A long linear game (`(;;;;…)` with hundreds of thousands of nodes) produces a deep tree. `Copy` and `toSGF` recurse once per level (unlike `Fmap`, which is iterative), overflowing the stack — an unrecoverable `fatal error`. `Merge` calls `toSGF`, so this is reachable from the multi-file upload path.
+A long linear game (`(;;;;…)` with millions of nodes) produces a deep chain. `toSGF` and `Copy` recurse once per level (unlike `Fmap`, which is iterative), overflowing the stack — an unrecoverable `fatal error` that `net/http` cannot catch.
 
-**Remediation:** Rewrite `Copy` and `toSGF` iteratively, or enforce the same depth cap as C-6 at parse time.
+> **Validation result (confirmed end-to-end):** `parser.Merge` calls `toSGF`, and `Merge` runs only when **≥2** SGFs are uploaded. This unauthenticated request killed the server, with the crash trace showing `(*SGFNode).toSGF`:
+> ```
+> POST /api/v1/room/{id}
+> {"event":"upload_sgf","value":["<b64 of '(' + ';'×12,000,000 + ')'>","<same>"]}
+> ```
+> Delivered through the same **uncapped array branch** as C-6.
+
+**Remediation:** Rewrite `toSGF` and `Copy` iteratively, or enforce a depth cap at parse time; and cap the array-branch input size.
+
+---
+
+### Uncapped `upload_sgf` array branch (crash-scale delivery path)  ·  High
+
+**Location:** `pkg/room/handlers.go:150-170`.
+
+`handleUploadSGF` enforces the `len(decoded) > 1<<20` ("file exceeds the 1MB maximum") check **only** on the string-value branch. When `value` is a JSON **array**, each element is base64-decoded and concatenated with **no size check**, then passed to `parser.Merge`. This is the delivery path that makes C-6 and H-7 exploitable at crash scale (a >8 MB payload that the string branch would reject). **Remediation:** apply the same 1 MiB (and element-count) cap to the array branch before parsing/merging.
 
 ---
 
@@ -334,11 +402,12 @@ Because this will front a public website, in addition to the code fixes:
 
 ## 8. Suggested remediation order
 
-1. **Stop the bleeding (crashes):** C-1 (recovery + comma-ok), C-2, C-6, H-7, M-6, M-7 — these are the trivially-triggerable unauthenticated hard crashes.
-2. **Cap allocations:** C-3, C-4, C-5, H-6, M-2, M-4.
-3. **Lock down the surface:** C-7, H-1, H-2, H-3, H-4, M-1, M-3.
-4. **Integration auth:** H-5, M-5.
-5. **Hardening:** all Low items + §7.
+1. **Stop the confirmed whole-server crashes first:** bound recursion in `parseBranch` (C-6) and `toSGF`/`Copy` (H-7); cap the `upload_sgf` **array branch** (the delivery path); cap board size (C-3); cap zip output + entry count (C-5). These are the trivially-triggerable unauthenticated hard crashes proven in §0.
+2. **Close the unauthenticated delivery surface:** authenticate/limit `POST /api/v1/room/{board}` and cap its body (C-7, M-2); cap WebSocket message size + add a read deadline (C-4).
+3. **Lock down the socket surface:** validate `Origin` (H-1); connection/room caps + rate limiting (H-2, H-3, M-8); HTTP timeouts (M-1); gate `/debug` (M-3).
+4. **Integration auth:** fail-closed on empty Twitch secret (H-5, M-5).
+5. **Robustness (lower urgency — net/http already contains the request-path panics):** comma-ok type checks + `recover()` in spawned goroutines (C-1, C-2, M-6, M-7).
+6. **Hardening:** all Low items + §7.
 
 ---
 
@@ -352,4 +421,4 @@ Because this will front a public website, in addition to the code fixes:
 - No hardcoded secrets are committed in the app config (aside from the sample Postgres/Grafana defaults noted in L-4/L-5).
 - No `InsecureSkipVerify` / disabled TLS verification anywhere in outbound clients.
 
-**Caveats:** This was a static/manual review; findings were not confirmed against a running instance. Line numbers reference the state of the repository at assessment time. Third-party dependency internals were not audited beyond version identification.
+**Caveats:** The findings began as a static/manual review; the Critical and High items were then **dynamically validated** with the PoCs in [`security/poc/`](security/poc/) against a locally-run instance (see §0), which corrected several severities. Items not exercised (most Medium/Low) remain static-only and are labelled by their code location. Line numbers reference the repository state at assessment time. Third-party dependency internals were not audited beyond version identification. Validation ran against the default in-memory configuration; behaviour behind a production reverse proxy (which may impose its own limits) was not tested.
