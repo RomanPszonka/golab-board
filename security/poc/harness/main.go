@@ -1,5 +1,6 @@
-// Command poc is a proof-of-concept harness for the Critical, High, and Medium
-// findings in ../../../SECURITY_ASSESSMENT.md (plus the second-pass a1/b1).
+// Command harness is a proof-of-concept exploit harness for the Critical, High,
+// and Medium findings in ../../../SECURITY_ASSESSMENT.md (run as
+// `go run ./security/poc/harness <id>`).
 //
 // It is intended to be run ONLY against a local, disposable test instance of
 // golab/board that you own and are authorised to test. Several PoCs crash or
@@ -52,12 +53,17 @@ func parseCommon(args []string) []string {
 	rest := []string{}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "-target":
+		case "-target", "-origin":
+			if i+1 >= len(args) {
+				fmt.Printf("missing value for %s\n", args[i])
+				os.Exit(2)
+			}
 			i++
-			target = args[i]
-		case "-origin":
-			i++
-			origin = args[i]
+			if args[i-1] == "-target" {
+				target = args[i]
+			} else {
+				origin = args[i]
+			}
 		default:
 			rest = append(rest, args[i])
 		}
@@ -601,7 +607,11 @@ func pocM4() {
 		_, _ = w.Write([]byte("INTERNAL-ONLY-SECRET (e.g. k8s service / cloud metadata)"))
 	})
 	internal := &http.Server{Handler: internalMux}
-	il, _ := net.Listen("tcp", "127.0.0.1:0")
+	il, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Println("listen error (internal):", err)
+		return
+	}
 	go internal.Serve(il)  //nolint:errcheck
 	defer internal.Close() //nolint:errcheck
 	internalURL := "http://" + il.Addr().String() + "/secret"
@@ -612,7 +622,11 @@ func pocM4() {
 		http.Redirect(w, r, internalURL, http.StatusFound)
 	})
 	edge := &http.Server{Handler: edgeMux}
-	el, _ := net.Listen("tcp", "127.0.0.1:0")
+	el, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		fmt.Println("listen error (edge):", err)
+		return
+	}
 	go edge.Serve(el)  //nolint:errcheck
 	defer edge.Close() //nolint:errcheck
 	edgeURL := "http://" + el.Addr().String() + "/redirect"
