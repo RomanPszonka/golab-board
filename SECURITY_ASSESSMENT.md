@@ -35,6 +35,8 @@ After the initial static review, every Critical and High finding was exercised w
 1. **The 1 MB upload cap is bypassable.** `handleUploadSGF` caps the decoded size at 1 MiB **only** on the string branch. The **array branch** (`value` as a JSON list) has **no cap** and feeds `parser.Merge` → the parser/serializer. This is what makes C-6/H-7 exploitable at crash-scale.
 2. **`recover()` is still worth adding** — not for the request path (net/http already covers it) but for the **spawned goroutines** (OGS plugin loop, heartbeat, message loop), where an unchecked assertion *is* an unrecovered whole-process crash.
 
+> A **second-pass, multi-agent crash hunt** (16 verified findings) followed up specifically on new attack surfaces, stacking low-severity issues into crashes, and *unrecoverable* session/board crashes. Its results are in **[§10](#10-second-pass-new-crash-surfaces-multi-agent-hunt)** and are the most important additions to this report — in particular a confirmed unauthenticated **whole-server crash via the OGS review plugin goroutine** (P2-A1) and a confirmed **persistent poison-pill that bricks a board on every load** (P2-B1).
+
 ---
 
 ## 1. Executive summary
@@ -422,3 +424,61 @@ Because this will front a public website, in addition to the code fixes:
 - No `InsecureSkipVerify` / disabled TLS verification anywhere in outbound clients.
 
 **Caveats:** The findings began as a static/manual review; the Critical and High items were then **dynamically validated** with the PoCs in [`security/poc/`](security/poc/) against a locally-run instance (see §0), which corrected several severities. Items not exercised (most Medium/Low) remain static-only and are labelled by their code location. Line numbers reference the repository state at assessment time. Third-party dependency internals were not audited beyond version identification. Validation ran against the default in-memory configuration; behaviour behind a production reverse proxy (which may impose its own limits) was not tested.
+
+---
+
+## 10. Second-pass: new crash surfaces (multi-agent hunt)
+
+A follow-up hunt targeted three questions the first pass did not fully answer: **new** attack surfaces, **stacking** low-severity issues into a crash, and **unrecoverable** session/board crashes. It produced 21 candidates; 16 survived adversarial verification against the `recover()` boundary. Every item below was checked for *which goroutine it runs in* — the decisive factor for whether a panic is contained (request goroutine) or fatal (spawned goroutine / runtime-fatal / persisted). Findings marked **★ empirically reproduced** were run locally.
+
+### A) New confirmed whole-server crashes
+
+#### P2-A1 — `Board.Set` nil / out-of-bounds via the OGS review goroutine · **Critical, new ★**
+- **Location:** `pkg/core/board/board.go:127-129` (`b.Points[c.Y][c.X] = col`, no nil/bounds guard), reached from `pkg/room/plugin/ogs.go:327-349`.
+- **Why it crashes the whole server:** the OGS plugin runs its receive/parse loop in `go o.loop(...)` (`ogs.go:198`) — a **spawned goroutine outside** net/http's per-request `recover()`. There is no `recover()` anywhere in `pkg/`. So a panic here aborts the whole process (unlike the request-path panics C-1/C-2).
+- **The bug:** `Board.Set` is unguarded, but its siblings are not — `Get` (`board.go:131`) is nil-and-bounds-checked and `SetMany` (`board.go:141`) uses `c.Valid`. `Board.Legal` calls the guarded `Get` first (returns `Empty` for an off-board/nil coord, so the "already a stone" check *passes*) and then calls the **unguarded** `Set` → panic. Reproduced: `Board.Move` with `(1000,1000)` or `(-1,-1)` → `runtime error: invalid memory address or nil pointer dereference`.
+- **Unauthenticated trigger:** create a review/demo on `online-go.com` (free account) containing an off-board move or a pass (`".."` → nil coord); open a WebSocket to any password-less room; send `{"event":"request_sgf","value":"https://online-go.com/review/<id>"}`. When OGS pushes the move, `loop` → `AddStonesToTrunk` → `smartGraft` → `board.Move` → `Set` panics in the spawned goroutine → server down. Even *non-malicious* reviews with unusual data can hit it.
+- **Fix:** guard `Board.Set` (`c != nil && c.Valid(size)`); reject nil/off-board coords in `Legal` before `Set`; comma-ok the OGS move parsing; wrap `loop()` in `defer recover()`.
+
+#### P2-A2 — OGS `loop()` unchecked type assertions (cluster) · **High/Critical, new**
+- **Locations:** `ogs.go:264,306,310,318,362-364,390-401,411-421` — `arr[0].(string)`, `payload["m"].(string)`, `int(payload["f"].(float64))` (existence-checked but type-unchecked), `gamedata["moves"].([]any)` (no length guard), `players["black"].(map[string]any)`, `["rank"].(float64)`, etc.
+- **Same non-recovered goroutine as P2-A1.** A malformed or merely *variant* OGS frame (a rengo/handicap game whose `players.black` isn't `{username,rank}`, a `moves` entry of length < 2, a wrong-typed `m`/`f`) panics the loop → whole-server crash.
+- **Confirmed vs plausible:** the goroutine reachability and crash class are **confirmed**; what is *plausible* (depends on whether OGS relays attacker-chosen JSON *types* verbatim) is some specific wrong-type triggers. P2-A1 is the clean, self-contained crash and does not depend on that. (The verifier rejected an "empty top-level frame → `arr[0].(string)`" trigger: the OGS envelope is server-generated `["<event>", data]`, so that specific mechanism is not producible.)
+- **Fix:** comma-ok every assertion in `loop`/`gamedataToSGF`/`gameInfoToSGF`/`initStateToSGF`; bounds-check slice indexes; the `defer recover()` in `loop()` alone converts this whole class from whole-server to contained.
+
+### B) Unrecoverable / persistent poison pill
+
+#### P2-B1 — Colon-less `LB` label bricks a board on every load · **High (Critical if OGS active), new ★**
+- **Location:** `pkg/state/frame.go:131` — `generateMarks` does `spl := strings.SplitN(lb, ":", 2); text := spl[1]` with **no length guard** (the PX/Pen branch at `frame.go:142` correctly guards with `if len(spl) != 5 { continue }`).
+- **Why it is unrecoverable:** `FromSGF` accepts `LB[z]` (a label with no colon) and stores it — parse succeeds. `UploadSGF` calls `SetState` (**commits** the poisoned state) *before* generating a frame, so the subsequent `GenerateFullFrame` panic never rolls it back. `ToSGFIX` writes `LB[z]` back verbatim, and `Hub.Save` persists it. On restart, `Hub.Load → room.Load → FromSGF` re-poisons the room; it loads clean and then **panics on the first `RegisterConnection → GenerateFullFrame`** (`room.go:441`). Reproduced: `(;GM[1]FF[4]SZ[19]LB[z])` → `FromSGF` OK, `GenerateFullFrame` → `index out of range [1] with length 1`.
+- **Recover framing (important):** each individual join panic is in the request goroutine and *is* recovered → the server survives, but the **room is permanently unjoinable** and the poison **survives restart** — the "per-room session that crashes on every access" the task asked about. **Escalation:** if the poisoned room has the OGS plugin active, the same `generateMarks` runs inside the OGS spawned goroutine (`BroadcastFullFrame`) → **unrecovered → whole-server crash**.
+- **Unauthenticated trigger:** `POST /api/v1/room/{id}` (or ws) with `{"event":"upload_sgf","value":"KDtHTVsxXUZGWzRdU1pbMTldTEJbel0p"}` (base64 of the SGF above) on any password-less room.
+- **Fix:** `if len(spl) != 2 { continue }` at `frame.go:131`; validate `LB` values in `FromSGF` so malformed marks are never committed or persisted.
+- **Rejected as poison pills (verifier):** `removeMarkCommand` `value[:2]` (`commands.go:256`) — durable but only evaluated on an explicit `remove_mark` command, and recovered per-connection (also, `&&` short-circuits, so only the `LB` branch slices — `SQ`/`TR` do not panic); and the GIB `alphabet[x]` panic — GIB is never persisted (rooms are stored as clean SGF), so it is recovered-per-connection only.
+
+### C) Stacking chains → exhaustion / OOM (fatal, bypass `recover()`)
+
+The terminal state of these is a Go-runtime **OOM**, which is fatal regardless of which goroutine allocates. Individually slow; the point is they **compose**, and `graft` removes the usual gates.
+
+- **P2-C1 — `graft` bypasses `authorized` *and* `outsideBuffer` · High, new.** `pkg/room/handlers.go:74` — `"graft": chain(r.handleEvent, r.broadcastFullFrameAfter)` is the only mutating handler with **neither** the password gate nor the rate-limit buffer (every sibling has both). So `graft` mutates **password-protected** rooms without ever sending `checkpassword`, unthrottled. This is the multiplier under C2–C4. **Fix:** add `r.authorized` and `r.outsideBuffer` to the graft chain.
+- **P2-C2 — Unbounded tree growth + quadratic full-frame rebroadcast · High, new.** `smartGraft` (`edit.go:271`) inserts every new move into `s.nodes` with no cap (`GetNextIndex` has no ceiling), and each `graft` re-serializes the *entire* tree (`saveTree` Fmap + `MaxDepth` a second Fmap, both O(n)) and broadcasts it to every connection → `O(k²·conns)` CPU and unbounded heap; the persisted SGF also inflates every future `Load`. Distinct from the recursion crashes (Fmap is iterative) and from the board-size OOM (which is auth-gated). **Fix:** per-room node cap; incremental frames for graft.
+- **P2-C3 — OGS fd + goroutine leak on every `request_sgf` · High, new.** `End()`/`closeOGS` set `o.Exit=true` but **never** call `o.Socket.Close()` (`ogs.go:201`). After deregister, `readSocketToChan` stays parked in `Socket.Read` and `loop` on `<-socketchan`; setting `Exit` cannot wake either. Net leak per event: **2 goroutines + 1 TCP fd** to online-go.com, unreclaimed and unthrottled (attacker is `lastUser`, so `outsideBuffer` is bypassed). **Fix:** `o.Socket.Close()` in `End()`; read deadline; cap concurrent connectors per room.
+- **P2-C4 — Uncapped frame length + uncapped persisted/broadcast fields · Medium/High.** Reconfirms C-4 (no max declared length, no read deadline; the 1 MB cap is inside `handleUploadSGF`, after the read) — and note the corrected mechanism (incremental growth, not an instant 4 GB). Stacks with **`update_nickname`** (`handlers.go:63`): no `authorized`, no `outsideBuffer`, no length cap — an oversized nick is held in `r.nicks` and the full N-entry map is re-marshalled to all N connections on every join/leave/nick-change (`N²·nick`); and with **uncapped comment text** appended into a persisted SGF field. **Fix:** length-cap frames/nicks/comments; gate `update_nickname`.
+- **P2-C5 — Unbounded per-room `auth` map · Medium, new (accelerant).** `SetAuth`/`SetAuthAll` write `r.auth[uuid]=true` but there is **no `delete(r.auth,…)` anywhere** — `DeregisterConnection` prunes only `conns`, the `Handle` defer only `nicks`. Reconnect (fresh UUID) → re-auth grows the map for the room's ~24h life; same UUIDs also leak into `message.notified`. Slow alone; an OOM accelerant across thousands of flooded rooms. (`lastMessages` at `room.go:39` is dead code — never written — not a leak.) **Fix:** delete `auth`/`notified` entries on disconnect.
+
+### D) New unguarded panic sites — contained (recovered), fix for defense-in-depth
+
+Same *contained* class as C-1/C-2 (each kills only the issuing connection) but at new locations; each becomes fatal if ever reached from a spawned goroutine, so guarding them also closes escalation doors:
+- **D1 — `commands.go:256`** `value[:2]` slice-bounds panic on a 1-char `LB` value via `remove_mark`.
+- **D2 — `coord.FromInterface`** (`coord.go:249`, `int(v.(float64))`) and other decoder assertions in `command_decoder.go` on wrong-typed command args.
+- **D3 — board/coord out-of-range** in `Score`/`Move` paths on crafted coords (companion to P2-A1 in the request path).
+
+### Answering the three questions directly
+
+1. **New attack surfaces:** yes — the **OGS review plugin** is the standout (A1/A2/C3): it parses attacker-influenceable data in an un-recovered goroutine and leaks resources. The **state/command layer** (graft, labels, nicknames) and the **persistence round-trip** were also largely un-audited before this pass.
+2. **Stacking low-severity → crash:** yes — `graft` (C1) unlocks unbounded tree growth (C2); OGS re-connect leaks (C3) and the `auth`-map/nick leaks (C4/C5) each trend to OOM, which is fatal and bypasses `recover()`. Room-flooding (H-2) multiplies all of them. And crash-to-force-reload (C-6) **stacks with the poison pill**: crash the server, and poisoned rooms come back bricked.
+3. **Unrecoverable session/board crash:** yes — **P2-B1** (colon-less `LB`) bricks a board on every load and survives restart; the earlier label-escaping bug (below) corrupts persisted labels on reload. Both are unauthenticated on the default password-less rooms.
+
+### Also noted (lower severity, from direct review)
+
+- **Label escaping is not round-trip safe.** The `label` command stores raw client text into `LB` (`commands.go:238`), and both serializers escape `]`→`\]` but **not** a literal `\` (`state.go:144`, `parser.go:64`). A label ending in `\` serializes to `[value\]`; on reload the parser (`sgfparser.go` `parseField`) consumes the `\]` as an escaped literal, so the field swallows the following `IX[n]`/field. Reproduced: standard `ToSGFIX` saves have a trailing `IX[n]` that supplies a terminator, so this **corrupts** labels/indices on reload rather than hard-failing — a persistent data-integrity bug, Medium, unauthenticated. (A field that is genuinely terminal reparses to `couldn't detect filetype` and the board is dropped.) **Fix:** also escape `\` in both serializers.
