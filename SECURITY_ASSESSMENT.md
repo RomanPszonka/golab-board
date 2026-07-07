@@ -351,6 +351,8 @@ A long linear game (`(;;;;…)` with millions of nodes) produces a deep chain. `
 
 ## 5. Medium findings
 
+> **All Medium findings are now PoC-verified.** Runnable: `m2` (unbounded body), `m3` ★ (`/debug` leak), `m4` ★ (SSRF redirect-follow), `m5` ★ (Twitch challenge echo), `m7` (coord/board OOB, recovered), and `c1`/`c2` (the two recovered panics downgraded from Critical); M-6 is `a1`. M-1 and M-8 are verified by code inspection (a config fact and a constant, not a runnable exploit). Each Medium is rated for the reverse-proxy/Kubernetes threat model in **[§11](#11-effectiveness-behind-a-reverse-proxy--in-kubernetes)**.
+
 ### M-1. No HTTP server timeouts → slow-loris
 `cmd/main.go:79` uses `http.ListenAndServe(url, a.Router)` with no `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, or `IdleTimeout`. Clients can hold connections open indefinitely. **Fix:** construct an `http.Server{}` with explicit timeouts (at minimum `ReadHeaderTimeout`).
 
@@ -482,3 +484,64 @@ Same *contained* class as C-1/C-2 (each kills only the issuing connection) but a
 ### Also noted (lower severity, from direct review)
 
 - **Label escaping is not round-trip safe.** The `label` command stores raw client text into `LB` (`commands.go:238`), and both serializers escape `]`→`\]` but **not** a literal `\` (`state.go:144`, `parser.go:64`). A label ending in `\` serializes to `[value\]`; on reload the parser (`sgfparser.go` `parseField`) consumes the `\]` as an escaped literal, so the field swallows the following `IX[n]`/field. Reproduced: standard `ToSGFIX` saves have a trailing `IX[n]` that supplies a terminator, so this **corrupts** labels/indices on reload rather than hard-failing — a persistent data-integrity bug, Medium, unauthenticated. (A field that is genuinely terminal reparses to `couldn't detect filetype` and the board is dropped.) **Fix:** also escape `\` in both serializers.
+
+---
+
+## 11. Effectiveness behind a reverse proxy / in Kubernetes
+
+This section answers a specific deployment question: **which findings still bite when the attacker has no direct/shell access to the server, the app runs in Kubernetes, and all traffic is behind a reverse proxy / ingress?** Every Critical, High, and Medium finding now has a runnable PoC in [`security/poc/`](security/poc/) (Medium PoCs added: `m2 m3 m4 m5 m7`; `c1 c2` cover the two downgraded Criticals; `a1` covers M-6). The verdicts below were reasoned against — and where marked ★, empirically reproduced against — a locally-run instance.
+
+### Threat model **D**
+
+- Attacker is a **remote client only** — no shell on the pod/node, no `kubectl`, no cluster network foothold.
+- **Kubernetes:** the pod has a **memory limit** (breach → `OOMKilled`) and a **liveness probe** that **auto-restarts** a crashed/hung pod in seconds. Because all room state is **in-memory**, the app is effectively **single-instance** (multiple replicas would split rooms across pods and break the app unless sticky-session + shared state, which it is not). Persistence is a **shared DB** (Postgres, or a PVC-backed SQLite) that **survives pod restarts**.
+- **Reverse proxy / ingress:** assume typical hardening — an **HTTP request-body cap** (e.g. nginx `client_max_body_size`, commonly ~1 MB), **read/send timeouts** (e.g. 60 s), and it **tunnels WebSocket** frames after upgrade (no body-size cap applies to WS payloads; only an idle-timeout governs a silent WS).
+
+### Two facts that decide most rows
+
+1. **The proxy caps HTTP bodies but *tunnels* WebSocket.** Every crash reachable through `upload_sgf`/the WS framing is deliverable over the WebSocket regardless of `client_max_body_size`. **★ Confirmed:** the C-6 12 MB array-upload, blocked as a 12 MB HTTP POST by a 1 MB cap, crashed the server with `fatal error: stack overflow` when delivered over the WebSocket. **So the proxy body cap is not a mitigation for the crash bugs.**
+2. **K8s auto-restart heals *transient* crashes but not *persisted* state.** OOM/stack-overflow crashes become a **repeatable transient DoS** (attacker re-sends, the pod flaps), but the **poison-pill P2-B1 and the persisted-corruption bugs survive the restart** — the pod reloads the poison and re-bricks. Under this model **P2-B1 is the single most dangerous finding**, precisely because self-healing does not touch it.
+3. **SSRF (M-4) is an *egress* problem — the ingress proxy is irrelevant.** Only a Kubernetes **egress NetworkPolicy** (or a locked-down egress) limits it, and the blast radius is *larger* in K8s: cluster-internal ClusterIP services and the cloud metadata endpoint `169.254.169.254` (IAM credentials) become reachable from the pod.
+
+### Effectiveness table
+
+Legend — **Yes** = works as-is under D · **WS** = works via WebSocket (HTTP vector capped by proxy) · **Partly** = blunted, not prevented · **Cond.** = needs a precondition · **Mitigated** = proxy/K8s largely prevents · **Per-conn** = only the attacker's own connection, no shared impact · **↻transient** = crashes but pod auto-restarts (repeatable) · **⚑persistent** = survives restart.
+
+| ID | Sev | PoC | Effective under D? | Why / K8s–proxy nuance |
+|----|-----|-----|--------------------|------------------------|
+| **P2-B1** | Crit | `b1` ★ | **Yes ⚑persistent** | `LB[z]` upload is tiny (passes any body cap); poison is stored in the shared DB → **auto-restart reloads it**; board bricked forever; whole-server crash-loop if OGS active. *The standout under D.* |
+| **C-6** | Crit | `c6` ★ | **Yes (WS) ↻transient** | 12 MB HTTP POST capped by proxy, but delivered over the tunneled WebSocket → confirmed stack overflow. Pod restarts; attacker re-sends. |
+| **H-7** | Crit | `h7` ★ | **Yes (WS) ↻transient** | Same WS channel, two-element array → `toSGF` overflow. |
+| **C-3** | Crit | `c3` ★ | **Yes ↻transient** | `size:200000` is a *tiny* request — passes every body cap, HTTP or WS. OOMKilled → restart → repeatable. |
+| **C-5** | Crit | `c5` ★ | **Yes (WS) ↻transient** | ~512 KB may pass the HTTP cap; larger bombs via WS. OOM → restart. |
+| **C-7** | Crit | `c7` ★ | **Partly / Yes** | Endpoint reachable through the proxy. Unauth *state control* + small payloads: Yes. Large crash bodies capped on HTTP → deliver via WS instead. |
+| **P2-A1 / M-6** | Crit | `a1` ★ | **Cond. → Yes ↻transient** | Trigger is a tiny `request_sgf`; needs the OGS feature + egress to online-go.com (default on) + an attacker-authored review. Non-recovered goroutine → whole-server crash. |
+| **P2-A2** | High | `a1` | **Cond. → Yes** | Same OGS goroutine; malformed/variant upstream frame. |
+| **H-1** | High | `h1` ★ | **Yes** | Origin unvalidated; the proxy forwards the browser-set `Origin`. Any website drives a visitor's boards — the most relevant risk for "board on my website." |
+| **H-2** | High | `h2` ★ | **Yes** | Normal WS to arbitrary room IDs; single in-memory replica accumulates rooms (1 h lifetime — M-8). |
+| **H-3** | High | `h3` ★ | **Partly** | Ingress/proxy per-IP connection limits may cap the flood; without them, Yes. |
+| **H-4** | High | `h4` | **Partly** | WS tunneled; the proxy idle-timeout (~60 s) closes a silent socket, but a slow *drip* keeps it alive and buffering. |
+| **C-4** | High | `c4` | **Partly** | Same as H-4 plus unbounded per-message buffering; proxy idle-timeout blunts the pure stall. |
+| **H-5** | High | `h5` ★ | **Cond.** | Only if the Twitch integration is enabled **and** the secret is empty; the webhook is public via the proxy, so a forged event is accepted. |
+| **P2-C1** | High | (graft) | **Yes** | Small `graft` commands pass the proxy; mutate even password-protected rooms (no `authorized`/`outsideBuffer`). Multiplier for C2–C4. |
+| **P2-C2** | High | (graft loop) | **Yes ↻/⚑** | Tiny grafts grow the tree unbounded → OOM → restart (repeatable); the **persisted SGF also inflates**, slowing every reload (a creeping, semi-persistent escalation). |
+| **P2-C3** | High | (req_sgf loop) | **Cond.** | Needs OGS egress; each `request_sgf` leaks 2 goroutines + 1 fd → OOM/fd-exhaustion → restart. |
+| **M-4** | Med | `m4` ★ | **Cond., high impact** | **Egress problem — ingress proxy irrelevant.** Needs an open-redirect on an approved host (or the OGS direct-`Fetch` paths). Without an egress NetworkPolicy, reaches ClusterIP services + `169.254.169.254` IAM metadata. |
+| **M-3** | Med | `m3` ★ | **Yes** | Normal unauthenticated `GET /b/{id}/debug` through the proxy leaks any room's full state, **including password-protected rooms**, unless ops explicitly blocks the path. |
+| **M-8** | Med | (inspection) | **Yes (amplifier)** | 3600 s heartbeat keeps abandoned rooms (+ goroutine) alive ≥1 h; worsens H-2 on the single replica. |
+| **M-5** | Med | `m5` ★ | **Yes (low impact)** | Public webhook reflects arbitrary `challenge` text unauthenticated; mainly a spec/integrity gap. |
+| **P2-C4** | Med | (nick) | **Yes** | `update_nickname` (no auth/no cap) → oversized nick re-broadcast `N²` per room. |
+| **P2-C5** | Med | (reconnect) | **Yes (slow)** | `auth`/`notified` maps never pruned; OOM accelerant across flooded rooms. |
+| Label-escape | Med | (§10) ★ | **Yes ⚑persistent** | Label ending in `\` corrupts persisted labels/indices on reload (survives restart). |
+| **M-2** | Med | `m2` ★ | **Mitigated (HTTP)** | `client_max_body_size` caps the HTTP body; the uncapped equivalent is the WS path (C-4). |
+| **M-1** | Med | (inspection) | **Mitigated** | The front proxy has its own timeouts/buffering and shields the origin from HTTP slow-loris. *Deployment reduces this one.* |
+| **C-1** | Med | `c1` ★ | **Per-conn** | `net/http` recovers the request-goroutine panic in every deployment; only the attacker's own connection drops. |
+| **C-2** | Med | `c2` ★ | **Per-conn** | As C-1 (GIB panic on upload is recovered). |
+| **M-7** | Med | `m7` ★ | **Per-conn** | `coord`/board OOB panic in the request path is recovered. (Same defect is fatal via the OGS goroutine — that's A1.) |
+
+### Bottom line for deploying behind a proxy in K8s
+
+- The reverse proxy **does not** protect against the crash/DoS findings that matter: the stack-overflow and OOM crashes are all deliverable over the **tunneled WebSocket**, and C-3 is a tiny request that passes any body cap. Treat the proxy body/timeout limits as protecting only the plain-HTTP `/api/v1` and `/ext` surfaces (which meaningfully mitigates M-1/M-2).
+- K8s auto-restart turns most crashes into a **repeatable transient DoS** rather than a permanent outage — *except* **P2-B1** (and the label-escape corruption), which **persist in the DB and survive the restart**. Fix `frame.go:131` (and the `LB` validation) before anything else if you value uptime, because self-healing will not save you there.
+- Two risks are **worse** in K8s than on a single box: **M-4 SSRF** (cluster-internal services + cloud IAM metadata — add an egress `NetworkPolicy`) and **M-3 /debug** (silent cross-room info disclosure — block the path at the ingress). Neither is addressed by the reverse proxy.
+- Because room state is in-memory, run it as a single instance (or add sticky sessions + shared state); note that any one crash drops **all** live boards on that pod.

@@ -32,6 +32,25 @@ Run with no arguments for the list. Finding IDs: `c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 
 - **`a1`** — `Board.Set` nil/out-of-bounds → **whole-server crash via the OGS review goroutine** (not recovered by net/http). Local call reproduces the fatal `Board.Move` panic; end-to-end delivery uses an attacker-authored online-go.com review + `request_sgf`.
 - **`b1`** — colon-less `LB` label → **persistent poison-pill** that bricks a board on every join and survives restart (`frame.go:131`). Local call reproduces the `GenerateFullFrame` panic; `-target` uploads it unauthenticated.
 
+### Medium-finding PoCs (see assessment §5, verified)
+
+- **`m2`** — unbounded HTTP request body (`io.ReadAll`, no `MaxBytesReader`); sends 40 MB, server buffers it all.
+- **`m3`** ★ — `GET /b/{id}/debug` leaks any room's full state unauthenticated (incl. password rooms).
+- **`m4`** ★ — SSRF: `internal/fetch` follows cross-host redirects with no timeout; self-contained demo pivots to an "internal" service. Egress problem — see §11 for the K8s impact.
+- **`m5`** ★ — Twitch webhook echoes the `challenge` before any signature check.
+- **`m7`** — `coord`/board out-of-range panic in the request path (recovered per-connection; same defect family as `a1`).
+- `c1`/`c2` cover the two Criticals downgraded to Medium (recovered panics).
+
+### Deployment effectiveness (assessment §11)
+
+§11 rates every Critical/High/Medium finding for whether it still works when the
+attacker has **no direct server access, the app runs in Kubernetes, and traffic
+is behind a reverse proxy**. Key results, empirically checked here: the crash
+bugs are deliverable over the **tunneled WebSocket** (bypassing `client_max_body_size`
+— confirmed with C-6 over WS), K8s auto-restart makes crashes a *repeatable
+transient* DoS **except** the persisted poison-pill `b1`, and SSRF (`m4`) is an
+**egress** problem the ingress proxy does not touch.
+
 ### Spinning up a disposable target
 
 ```
