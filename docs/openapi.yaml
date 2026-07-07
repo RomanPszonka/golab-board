@@ -9,7 +9,19 @@ info:
     The interactive, real-time surface is a WebSocket at
     `/socket/b/{boardID}` and is NOT modeled here (OpenAPI does not describe
     WebSocket message framing well); see docs/api.md for the WebSocket protocol.
-    This document covers the REST, service, export, and web/Twitch HTTP routes.
+
+
+    Scope: this document models the REST API, the service/health endpoints, the
+    SGF export routes, and the primary web + Twitch webhook routes. It does not
+    model every HTML page (e.g. `/about`, `/integrations`) or the Twitch OAuth
+    redirect endpoints (`/apps/twitch/subscribe`, `/apps/twitch/unsubscribe`,
+    `GET /apps/twitch/callback`) — those are browser-driven and documented in
+    docs/api.md.
+
+
+    Content-Type note: the JSON endpoints below return JSON *bodies*, but the
+    server does not set a `Content-Type` header, so responses are served as
+    `text/plain; charset=utf-8`. Parse by body shape, not by header.
 
 
     The REST API is a single endpoint whose behavior is a discriminated union
@@ -231,9 +243,15 @@ components:
       in: path
       name: boardID
       required: true
-      description: Room identifier. Lowercased and stripped to [a-z0-9-].
+      description: >
+        Room identifier. Use only [a-z0-9-] (lowercase). The REST route does not
+        normalize this value — it keys the room by the raw string — and the web
+        page /b/{boardID} rejects IDs outside [a-z0-9-] with a 400. Sticking to
+        that character set keeps the REST, WebSocket, and web routes pointing at
+        the same board.
       schema:
         type: string
+        pattern: '^[a-z0-9-]+$'
         example: demo
 
   schemas:

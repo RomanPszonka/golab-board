@@ -21,7 +21,7 @@ Board is a single, self-contained Go binary (`cmd/main.go`) that serves:
 | WebSocket | `/socket/b/{boardID}` | Live, shared board play |
 | REST API v1 | `/api/v1/room/{boardID}` | Stateless-style HTTP access to a board |
 | Service API | `/api/ping`, `/api/version`, `/api/stats` | Health & introspection |
-| SGF export | `/b/{boardID}/sgf`, `/sgfix`, `/debug` | Download board state |
+| SGF export | `/b/{boardID}/sgf`, `/b/{boardID}/sgfix`, `/b/{boardID}/debug` | Download board state |
 | Twitch integration | `/apps/twitch/*` | Optional; OAuth + EventSub |
 
 Everything is compiled into one image and listens on a **single port (8080)**.
@@ -238,7 +238,10 @@ inside the big config Secret, template it at pod start with an init step:
 # In the pod spec: render /etc/board/config.yaml from a template + env at boot.
 initContainers:
   - name: render-config
-    image: busybox:1.36
+    # NOTE: use an image that actually ships `envsubst` (it comes from gettext).
+    # Plain busybox does NOT include envsubst. Options: a gettext image, or swap
+    # the command for a busybox-native `sed`.
+    image: ghcr.io/a8m/envsubst:latest # or e.g. bhgedigital/envsubst, alpine + `apk add gettext`
     command: ["sh", "-c", "envsubst < /tmpl/config.yaml > /etc/board/config.yaml"]
     env:
       - name: BOARD_DB_PATH
@@ -246,10 +249,14 @@ initContainers:
     volumeMounts:
       - { name: tmpl, mountPath: /tmpl }
       - { name: rendered, mountPath: /etc/board }
+# Busybox-only alternative (no extra image), substituting one placeholder with sed:
+#   image: busybox:1.36
+#   command: ["sh", "-c", "sed \"s#__BOARD_DB_PATH__#$BOARD_DB_PATH#\" /tmpl/config.yaml > /etc/board/config.yaml"]
+#
 # ...then mount `rendered` (emptyDir) into the board container at /etc/board,
-# and put a config.yaml template with `path: "${BOARD_DB_PATH}"` in a ConfigMap
-# mounted at /tmpl. (busybox has no envsubst; use a small image that does, or
-# sed.) This keeps the DSN in a dedicated Secret while the app still just reads a file.
+# and put a config.yaml template (with `path: "${BOARD_DB_PATH}"` for envsubst,
+# or `path: "__BOARD_DB_PATH__"` for the sed variant) in a ConfigMap mounted at
+# /tmpl. This keeps the DSN in a dedicated Secret while the app still just reads a file.
 ```
 
 This is purely a secrets-hygiene convenience; functionally identical to putting
@@ -262,10 +269,14 @@ the DSN in the config Secret directly.
 Common integration patterns:
 
 - **Embed a board in your app's UI.** Point an `<iframe>` (or a link/popout) at
-  `https://board.example.com/b/<your-room-id>`. Any string works as a room ID;
-  it is sanitized to `[a-z0-9-]` (`core.Sanitize`). Derive the room ID from your
-  own domain objects (e.g. `match-<uuid>`) so each of your entities gets a stable
-  board. Rooms are created on first visit — no provisioning call needed.
+  `https://board.example.com/b/<your-room-id>`. **Choose room IDs that already
+  match `[a-z0-9-]` (lowercase).** The web route `/b/{boardID}` rejects anything
+  else with a 400 (it compares the ID against `core.Sanitize` and refuses rather
+  than silently stripping), and the REST route keys rooms by the raw ID without
+  sanitizing — so an unsanitized ID can create a room that the browser page can
+  never open, or split traffic across two differently-spelled rooms. Derive the
+  ID from your own domain objects (e.g. `match-<uuid>`) using only those
+  characters. Rooms are created on first visit — no provisioning call needed.
 - **Drive a board from your backend.** Use the REST API
   (`POST /api/v1/room/{boardID}`) to place stones, upload SGF, navigate, etc.,
   from server-side code without opening a WebSocket. See [api.md](api.md).

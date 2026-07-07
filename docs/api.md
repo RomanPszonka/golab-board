@@ -28,9 +28,15 @@ spec](#generating--serving-the-spec).
 ## Concepts
 
 - **Room / board.** A room is one shared Go board, addressed by a `boardID`
-  string. Any ID works; it is lowercased and stripped to `[a-z0-9-]` by
-  `core.Sanitize`. Rooms are created on first access (visit, socket, or API
-  call) — there is no "create room" call.
+  string. **Use only `[a-z0-9-]` (lowercase).** Handling differs by route and is
+  *not* uniform: the WebSocket route sanitizes the ID (`core.Sanitize`); the web
+  page `/b/{boardID}` **rejects** IDs containing anything else with a 400 rather
+  than stripping; and the REST route `/api/v1/room/{boardID}` uses the raw ID
+  verbatim (no sanitizing). So an ID like `Foo_Bar` can create a REST/socket room
+  that the browser page can never open, or resolve to a different room than you
+  expect. Stick to lowercase alphanumerics and hyphens to keep all three routes
+  pointing at the same board. Rooms are created on first access (visit, socket,
+  or API call) — there is no "create room" call.
 - **Event.** Every action — over WebSocket or REST — is a JSON *event* with a
   `event` type and an optional `value`. The same event vocabulary drives both
   transports (`Room.HandleAny`, `pkg/room/handlers.go`).
@@ -193,6 +199,10 @@ Notes:
 - The REST path shares the room map with WebSocket clients. A REST mutation is
   broadcast to any WebSocket clients connected to the **same room on the same
   process** (see the scaling note in [kubernetes.md](kubernetes.md#6-scaling-horizontally)).
+- **Response `Content-Type`.** The response *body* is JSON, but the server does
+  not currently set a `Content-Type` header on these responses, so Go serves them
+  as `text/plain; charset=utf-8`. Parse the body as JSON regardless; don't rely on
+  the header. (The same applies to the `/api/*` service endpoints below.)
 
 Example:
 
@@ -330,10 +340,16 @@ Important properties:
   reconnects and is **not** a durable per-user identity.
 - A room password is therefore a **shared secret for that room**, not an
   allow-list of specific users.
-- Over **REST**, there is no persistent connection to carry an authorized
-  connection ID, so password-gated events are effectively unauthenticated in
-  practice — treat the REST API as trusted/server-side only, and don't expose it
-  directly to untrusted clients.
+- Over **REST**, the room-password gate is effectively bypassable, so treat the
+  REST API as trusted/server-side only and never expose it directly to untrusted
+  clients. Concretely: the `authorized` check keys off the event's `userid`, and
+  the REST handler (`pkg/hub/apiv1router.go`) passes the client-supplied `userid`
+  from the JSON body straight through — it does **not** override it the way the
+  WebSocket path does (`Room.Handle` calls `evt.SetUser(connID)`). A REST client
+  can therefore pick any stable `userid`, `POST` `checkpassword` once with that
+  `userid` to mark itself authorized, and then perform every password-gated event
+  under the same `userid`. The password protects the *browser* flow, not the REST
+  surface.
 
 **To restrict a board to specific users of your own server**, authenticate in
 front of Board at the Ingress (oauth2-proxy / forward-auth). See
