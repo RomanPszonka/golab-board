@@ -52,9 +52,9 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | H-8 | High | OGS plugin fd + goroutine leak on every `request_sgf` | PoC `gl1`* | Cond.(OGS) ↻ |
 | M-1 | Medium | `/debug` leaks full room state unauthenticated (incl. password rooms) | PoC `m3` | Yes |
 | M-2 | Medium | SSRF via redirect-following + untimed/unbounded fetch | PoC `m4` | Cond.; high in K8s |
-| M-3 | Medium | `update_nickname` no auth / no length cap → N² rebroadcast | insp. | Yes |
-| M-4 | Medium | Unbounded per-room `auth`/`notified` maps (never pruned) | insp. | Yes |
-| M-5 | Medium | SGF label escaping not round-trip safe → persisted corruption | insp. | Yes ⚑ |
+| M-3 | Medium | `update_nickname` no auth / no length cap → N² rebroadcast | PoC `nick` | Yes |
+| M-4 | Medium | Unbounded per-room `auth`/`notified` maps (never pruned) | PoC `authleak` | Yes |
+| M-5 | Medium | SGF label escaping not round-trip safe → persisted corruption | PoC `sgfesc` | Yes ⚑ |
 | M-6 | Medium | 1-hour heartbeat keeps abandoned rooms alive (amplifier) | insp. | Yes |
 | M-7 | Medium | Twitch: challenge echoed before verify; no replay protection | PoC `m5` | Yes (low) |
 | M-8 | Medium | Unbounded HTTP request body (`io.ReadAll`, no `MaxBytesReader`) | PoC `m2` | Proxy-mitigated |
@@ -81,15 +81,17 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | CS-2 | Medium | Password > 72 bytes silently disables room protection | PoC `cs2` | n/a (owner footgun) |
 | DR-4 | Medium | `OGSConnector.Exit` read without lock (written under lock) | insp. | Cond.(OGS) |
 | GL-2 | Medium | `readSocketToChan` blocks forever on channel send after game-over → goroutine leak | insp. | Cond.(OGS) |
-| ID-1 | Medium | Password gates writes only — anon socket reads a protected room's full state/moves | insp. | Yes |
+| ID-1 | Medium | Password gates writes only — anon socket reads a protected room's full state/moves | PoC `id1` | Yes |
 | ID-2 | Medium | Raw internal fetch/parser errors broadcast to clients (internal IPs/DNS, SSRF oracle) | insp. | Yes |
-| ID-3 | Medium | Hand-rolled JSON on `/api/v1` interpolates raw error/value → JSON injection + infoleak | insp. | Yes |
+| ID-3 | Medium | Hand-rolled JSON on `/api/v1` interpolates raw error/value → JSON injection + infoleak | PoC `id3` | Yes |
 | DL-3 | Low | `Room.Close` holds `r.mu` across `conn.Close` → room/goroutine/fd leak on a stalled client | insp. | Cond. |
 | GL-3 | Low | Postgres pool bounds unset → transient connection exhaustion | insp. | n/a |
 | AZ-3 | Low | `outsideBuffer` throttle keyed on client `userid` (bypassable; not authz) | insp. | Yes |
 | AZ-4 | Low | `GetAuth` returns key-existence → `SetAuth(id,false)` revocation is a silent no-op | insp. | Per-conn |
-| ID-4 | Low | `ApprovedFetch` allowlist-enumeration oracle + requested-host reflection | insp. | Yes |
+| ID-4 | Low | `ApprovedFetch` allowlist-enumeration oracle + requested-host reflection | PoC `id3` | Yes |
 | ID-5 | Low | Twitch OAuth callback echoes internal client errors | insp. | Cond. |
+
+**Remaining `insp.` findings** are either configuration facts (M-6 the 1-hour heartbeat constant; M-9 the missing `http.Server` timeouts) or require live egress to `online-go.com` to reproduce at runtime (H-8 socket-close, DR-4, GL-2, ID-2); their root causes are confirmed in source and, where applicable, by a related PoC (`gl1`, `id3`).
 
 **Not exploitable / mitigated** (documented so they are not re-raised): NGF/SGF oversized-board OOM (clamped by `FromSGF`), `remove_mark value[:2]` and the GIB `alphabet[x]` panic (recovered per-connection; GIB is never persisted). See [§8](#8-not-exploitable--mitigated).
 
@@ -193,13 +195,13 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 ### M-2 — SSRF via redirect-following + untimed/unbounded fetch · PoC `m4`
 `internal/fetch` uses `http.DefaultClient` (follows redirects, no timeout) and `io.ReadAll`s the body (no size cap); `ApprovedFetch` checks only the **first** hop's hostname. Reproduced (`m4`): `Fetch` followed a redirect to an "internal" service. Reachability needs an open-redirect on an approved host (or the `OGSCheckEnded`/`FetchOGS` direct-`Fetch` paths). **Behind proxy / K8s:** this is an **egress** problem the ingress proxy does not touch; blast radius in K8s includes cluster-internal ClusterIP services and `169.254.169.254` (cloud IAM metadata). **Fix:** a client with a timeout and a redirect policy that re-validates each hop's host against the allow-list; `io.LimitReader` the body; add an egress `NetworkPolicy`.
 
-### M-3 — `update_nickname` no auth / no length cap → N² rebroadcast · insp.
+### M-3 — `update_nickname` no auth / no length cap → N² rebroadcast · PoC `nick`
 `pkg/room/handlers.go:63` — `update_nickname` has no `authorized`, no `outsideBuffer`, and no length cap; an oversized nick is held in `r.nicks` and the full N-entry map is re-marshalled to all N connections on every join/leave/nick-change. **Behind proxy / K8s:** Yes. **Fix:** length-cap nicks; gate the handler.
 
-### M-4 — Unbounded per-room `auth`/`notified` maps · insp.
+### M-4 — Unbounded per-room `auth`/`notified` maps · PoC `authleak`
 `pkg/room/room.go:198` — `SetAuth`/`SetAuthAll` write `r.auth[uuid]=true` but nothing ever `delete`s from `auth` (or `message.notified`); `DeregisterConnection` prunes only `conns`. Reconnects (fresh UUIDs) grow the maps for the room's ~24 h life — an OOM accelerant across flooded rooms. (`lastMessages` is dead code — never written.) **Behind proxy / K8s:** Yes (slow). **Fix:** delete `auth`/`notified` entries on disconnect.
 
-### M-5 — SGF label escaping not round-trip safe → persisted corruption · insp.
+### M-5 — SGF label escaping not round-trip safe → persisted corruption · PoC `sgfesc`
 The `label` command stores raw client text into `LB` (`commands.go:238`), and both serializers escape `]`→`\]` but **not** a literal `\` (`state.go:144`, `parser.go:64`). A label ending in `\` serializes to `[value\]`; on reload the parser consumes the `\]` as an escaped literal and the field swallows the following one. On the standard `ToSGFIX` save (trailing `IX[n]` supplies a terminator) this **corrupts** labels/indices on reload rather than hard-failing; a genuinely terminal field reparses to an error and the board is dropped. **Behind proxy / K8s:** Yes, persistent. **Fix:** also escape `\` in both serializers.
 
 ### M-6 — 1-hour heartbeat keeps abandoned rooms alive · insp.
@@ -273,13 +275,13 @@ These are the results of a dedicated review of issue classes beyond DoS/parsing.
 
 ### Information disclosure
 
-**ID-1 — Password gates writes only; anyone reads a protected room · Medium.** `Handle` accepts any WS with no auth check and `RegisterConnection` immediately pushes `GenerateFullFrame(Full)`; `Broadcast` relays every move and `connected_users` (UUIDs) to all connections. `authorized` gates only mutating handlers, never the connect/read path — so an anonymous socket to a "protected" room receives the full board, every live move, and occupant UUIDs. **Fix:** gate the connect/read path if read-privacy is intended (and note this feeds AZ-1's UUID harvest).
+**ID-1 — Password gates writes only; anyone reads a protected room · Medium · PoC `id1`.** `Handle` accepts any WS with no auth check and `RegisterConnection` immediately pushes `GenerateFullFrame(Full)`; `Broadcast` relays every move and `connected_users` (UUIDs) to all connections. `authorized` gates only mutating handlers, never the connect/read path — so an anonymous socket to a "protected" room receives the full board, every live move, and occupant UUIDs. **Fix:** gate the connect/read path if read-privacy is intended (and note this feeds AZ-1's UUID harvest).
 
 **ID-2 — Raw internal fetch/parser errors broadcast to clients · Medium.** `Fetch` returns the verbatim `*url.Error` (rewritten internal OGS API URL, resolved backend IP, local resolver `127.0.0.53:53`), wrapped into `ErrorEvent` and broadcast to every connection (`handlers.go:209/250`). Discloses internal request topology and gives an SSRF/liveness oracle (DNS-fail vs conn-refused vs parse-error are distinguishable). **Fix:** generic client messages; log details server-side only.
 
-**ID-3 — Hand-rolled JSON on `/api/v1` → JSON injection + infoleak · Medium.** `apiv1router.go` builds responses with `fmt.Sprintf(\`{"error":"%s"}\`, …)` interpolating the raw error/value (which for a failed `request_sgf` is a `*url.Error` containing quotes and `dial tcp <ip>:<port>`). The unescaped quotes break out of the JSON string (response injection) and leak internals. **Fix:** build a struct and `json.Marshal`; map errors to a generic message.
+**ID-3 — Hand-rolled JSON on `/api/v1` → JSON injection + infoleak · Medium · PoC `id3`.** `apiv1router.go` builds responses with `fmt.Sprintf(\`{"error":"%s"}\`, …)` interpolating the raw error/value (which for a failed `request_sgf` is a `*url.Error` containing quotes and `dial tcp <ip>:<port>`). The unescaped quotes break out of the JSON string (response injection) and leak internals. **Fix:** build a struct and `json.Marshal`; map errors to a generic message.
 
-**ID-4 — Allowlist-enumeration oracle + host reflection · Low.** `ApprovedFetch` returns `"unapproved URL. contact us to add <host>"` for a disallowed host vs a raw dial error for an allowed-but-unreachable one — a distinguisher that lets an attacker enumerate `okList` and reflects an arbitrary host into a client-visible broadcast. **Fix:** generic message, no host reflection.
+**ID-4 — Allowlist-enumeration oracle + host reflection · Low · PoC `id3`.** `ApprovedFetch` returns `"unapproved URL. contact us to add <host>"` for a disallowed host vs a raw dial error for an allowed-but-unreachable one — a distinguisher that lets an attacker enumerate `okList` and reflects an arbitrary host into a client-visible broadcast. **Fix:** generic message, no host reflection.
 
 **ID-5 — Twitch OAuth callback echoes internal errors · Low.** `twitchrouter.go` returns `http.Error(w, err.Error(), 403)` on the state/exchange path, echoing internal client errors to the caller. **Fix:** generic messages.
 

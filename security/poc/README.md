@@ -17,8 +17,8 @@ go run ./security/poc/harness <id> [-target localhost:8080] [-origin url]
 
 Run with no arguments for the list.
 
-- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1` (`h6` verifies a *mitigation*).
-- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1`.
+- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1` (`h6` verifies a *mitigation*).
+- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3`.
 - **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3.
 - `b1` also runs end-to-end with `-target` (uploads the poison; then join the room to see it brick).
 
@@ -58,6 +58,13 @@ authoritative list and status).
 | `az2` | AZ-2 | Setting a password grandfathers an idling attacker's connection (`SetAuthAll`). |
 | `cs1` | CS-1 | The Postgres DSN password survives `Config.Redact()` (a no-op for `db`) and is logged at startup. |
 | `go test -race ./security/poc/race/` | DR-2 / DR-3 | Torn-read races: the full-frame / `Current().AllFields()` are read outside `r.mu` while fields mutate under it (race detector fires). |
+| `nick` | M-3 | `update_nickname` sets a 200 KB nick on a **password** room, unauthenticated — no auth gate, no cap. |
+| `authleak` | M-4 | 5 authed connections disconnect → all 5 stay authorized (auth map never pruned). |
+| `sgfesc` | M-5 | A label ending in `\` swallows the following `PB` field on reload (escaping not round-trip safe). |
+| `id1` | ID-1 | Unauthenticated connect to a **password** room receives the full board frame (reads are ungated). |
+| `id3` | ID-3 / ID-4 | `/api/v1` reflects the requested host verbatim and interpolates it un-escaped into JSON → injection + allowlist oracle. |
+
+**Remaining inspection-only** (with reason): **M-6** (1-hour heartbeat) and **M-9** (no `http.Server` timeouts) are configuration constants, not runtime exploits; **DR-4** (OGS `Exit` race) and **GL-2** (OGS channel-send leak) require live goroutines against `online-go.com`; **ID-2** (internal IP/DNS in fetch errors) shares its sink with `id3` but the internal-address specifics need a real dial failure; **ID-5** (Twitch OAuth error echo) is on the OAuth flow. **H-8**'s socket-close portion likewise needs OGS egress (root cause shown by `gl1`).
 | `h6` | (mitigation) | Verifies the `FromSGF` `size>19` clamp — the NGF/SGF board-OOM path is **not** exploitable. |
 
 Findings verified by code inspection only (no runnable command) — H-6, H-7, H-8,
