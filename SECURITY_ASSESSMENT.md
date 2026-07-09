@@ -10,7 +10,7 @@
 
 Every client is anonymous and can open a WebSocket, create rooms, upload files, and drive board state — a large, fully **unauthenticated** attack surface. The findings fall into these groups:
 
-- **Whole-server crashes (8 Critical) + one stored-XSS Critical (9 total).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb → OOM), a **panic in a spawned goroutine** (the OGS review plugin, which `net/http` does not recover), or a **concurrent-map data race** (`fatal error: concurrent map iteration and map write` via the nicknames map — also not recoverable). All were reproduced.
+- **Whole-server crashes (9 Critical) + one stored-XSS Critical (10 total).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb, or **exponential copy/paste state amplification** — each `copy`+`clipboard` pair doubles the tree → OOM), a **panic in a spawned goroutine** (the OGS review plugin *and* the OGS gamedata→SGF read loop, neither recovered by `net/http`), or a **concurrent-map data race** (`fatal error: concurrent map iteration and map write` via the nicknames map — also not recoverable). All were reproduced.
 - **One unrecoverable board (persistent poison-pill).** A crafted label (`LB[z]`) is committed and persisted, then panics on every load — the board is permanently unjoinable and the poison **survives restarts** (see C-2).
 - **Concurrency: data races & lock-held-during-I/O (§6).** Beyond the crash race, several torn-slice races (`fatal`/SIGSEGV) and — confirmed — **one stuck-reading client freezes an entire room** because `Broadcast` holds `r.mu` across the blocking socket write (escalating hub-wide via `SendMessages`).
 - **Authorization bypass (§6).** The `/api/v1` HTTP path trusts the client-supplied `userid`, so an attacker can replay an authenticated occupant's connection UUID and take over a **password-protected** room; and enabling a password grandfathers every currently-connected (incl. hostile) socket.
@@ -31,7 +31,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 
 ## 2. Findings — master table
 
-**Status:** `PoC` = reproduced with the named harness command (`go run ./security/poc/harness <cmd>`) · `race†` = reproduced under the race detector (`go test -race ./security/poc/race/`) · `gl1*` = the leak's root cause is reproduced (`gl1`); the OGS-socket portion needs live egress to online-go.com · `insp.` = confirmed by code inspection.
+**Status:** `PoC` = reproduced with the named harness command (`go run ./security/poc/harness <cmd>`) · `race†` = reproduced under the race detector (`go test -race ./security/poc/race/`) · `1c‡` = reproduced with a Go test (`go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/`) · `gl1*` = the leak's root cause is reproduced (`gl1`); the OGS-socket portion needs live egress to online-go.com · `insp.` = confirmed by code inspection.
 **Behind proxy / K8s:** `Yes` = effective as-is · `WS` = effective via the tunneled WebSocket (HTTP vector capped) · `↻` = crashes but the pod auto-restarts (repeatable transient DoS) · `⚑` = persists across restarts · `Partly` = blunted, not prevented · `Cond.` = needs a precondition · `Proxy-mitigated` = the proxy largely prevents it · `Per-conn` = affects only the attacker's own connection.
 
 | # | Sev | Finding | Status (PoC) | Behind proxy / K8s |
@@ -44,6 +44,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | C-5 | Critical | Board-size memory exhaustion (`update_settings` size unbounded) | PoC `c3` | Yes ↻ |
 | C-6 | Critical | ZIP bomb — unbounded in-memory decompression | PoC `c5` | Yes (WS) ↻ |
 | C-7 | Critical | Unauthenticated state control + crash delivery (`POST /api/v1/room`, uncapped `upload_sgf` array branch) | PoC `c7` | Yes / Partly |
+| C-8 | Critical | Copy/paste exponential state amplification — each `copy`+`clipboard` pair doubles the tree (`current` never advances) → 2ᵏ nodes → OOM | PoC `copybomb` | Yes (WS) ↻ |
 | XSS-1 | Critical | Stored XSS via board labels (SVG `<text>.innerHTML`, `boardgraphics.js:516`) — arbitrary JS in every viewer, in the embedding origin | PoC `xss_label.js` | Yes |
 | XSS-1b | High | Second label XSS sink (`boardgraphics.js:540`) via a digit-prefixed label — a fix to :516 alone misses it | PoC `xss_label.js` | Yes |
 | XSS-2 | High | Reflected XSS broadcast to all room members via a malformed `request_sgf` URL → error-modal `innerHTML` (`modals.js:183`) | PoC `xss_error_modal.js` | Yes |
@@ -56,6 +57,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | H-6 | High | `graft` handler bypasses `authorized` + rate-limit middleware | PoC `graft` | Yes |
 | H-7 | High | Unbounded per-room tree growth + quadratic full-frame rebroadcast | PoC `grow` | Yes ↻ |
 | H-8 | High | OGS plugin fd + goroutine leak on every `request_sgf` | PoC `gl1`* | Cond.(OGS) ↻ |
+| H-9 | High | OGS gamedata→SGF assertion cascade: malformed/rengo `gamedata` panics the OGS read-loop goroutine (unrecovered) — **whole-server crash, Critical if OGS active** | PoC `1c`‡ | Cond.(OGS) → Yes ↻ |
 | M-1 | Medium | `/debug`, `/sgf`, `/sgfix` download a **password-protected** room's full game/state with no password | PoC `m3` | Yes |
 | M-2 | Medium | SSRF via redirect-following + untimed/unbounded fetch | PoC `m4` | Cond.; high in K8s |
 | M-3 | Medium | `update_nickname` no auth / no length cap → N² rebroadcast | PoC `nick` | Yes |
@@ -66,6 +68,8 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | M-8 | Medium | Unbounded HTTP request body (`io.ReadAll`, no `MaxBytesReader`) | PoC `m2` | Proxy-mitigated |
 | M-9 | Medium | No HTTP server timeouts (`http.ListenAndServe`, no `http.Server{}`) | insp. | Proxy-mitigated |
 | M-10 | Medium | Unchecked-input panics on the request path (type assertions, coord/board OOB) — contained by net/http | PoC `c1`,`c2`,`m7` | Per-conn |
+| M-11 | Medium | `update_settings` board size >19 persists `SZ[20]`; `FromSGF` then rejects it on restart → the room is **silently dropped** (unauthenticated persistent data loss, trivial RAM — not C-5's OOM) | PoC `sizepoison` | Yes ⚑ |
+| M-12 | Medium | `FromSGF`/paste are O(N²) (`gotoIndex` rewinds to root + walks forward per setup node) → a single ~20 KB `upload_sgf` of empty nodes pins a core ~1 min | PoC `sgfquad` | Yes (WS) ↻ |
 | L-1 | Low | `GET /ext/upload` has side effects (CSRF, server-side fetch) | insp. | Yes |
 | L-2 | Low | No HTTP security headers (CSP, X-Frame-Options, …) | insp. | Yes |
 | L-3 | Low | Container runs as root | insp. | n/a |
@@ -167,6 +171,15 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 - **Behind proxy / K8s:** unauth state control passes the proxy; large crash bodies are capped on HTTP → deliver over WS instead.
 - **Fix:** authenticate/limit the endpoint, wrap the body in `http.MaxBytesReader`, and cap the array branch.
 
+### C-8 — Copy/paste exponential state amplification → OOM · PoC `copybomb`
+- **Location:** `pkg/state/commands.go:486` (`copyCommand.Execute` → `s.clipboard = s.current.Copy()`, a **deep** copy of the whole subtree under `current`) and `pkg/state/edit.go:398` (`paste()` → `branch := s.clipboard.Copy()`, reindex, `s.current.Down = append(s.current.Down, branch)`). Wired via `command_decoder.go:197` (`copy`→`NewCopyCommand`, `clipboard`→`NewPasteCommand`); both route to the `_` default handler.
+- **Mechanism:** neither `copy` nor `clipboard` advances `s.current`. With `current` pinned at the root, **every `copy` captures the entire tree and every `clipboard` appends another copy of it** — so each `copy`+`clipboard` pair doubles the node count: N → 2N. `k` alternating pairs ⇒ **2ᵏ nodes**. `copyCommand.Execute` also runs `s.current.Copy()` at 2ᵏ each round, and `paste` re-serializes the whole tree (`saveTree(Full)`), so both CPU and heap blow up exponentially.
+- **Why the rate limit does not help:** `outsideBuffer` only throttles *different* users interleaving; after the attacker's first event `setTimeAfter` pins `lastUser = attacker`, so all their subsequent events skip the buffer check. `authorized` is a no-op on an open (default) room. So a single **unauthenticated** client on any open room drives this freely.
+- **Trigger (unauthenticated):** open `ws /socket/b/{id}` and send `~28` alternating events: `{"event":"copy"}` then `{"event":"clipboard"}`. 2²⁸ ≈ 2.7×10⁸ `TreeNode`s → multi-GB heap → **fatal Go OOM**. A heap OOM is **not** recovered by `net/http` → whole-server crash.
+- **Reproduced:** `copybomb` drives the real room handler chain and shows exact doubling: `2, 4, 8, …, 262144` nodes over 18 cycles (78 MiB live at 2¹⁸; each extra cycle doubles it). Capped at 18 so the PoC itself stays safe; the extrapolation to ~28 → OOM is arithmetic.
+- **Behind proxy / K8s:** Yes via the tunneled WebSocket (tiny events; no HTTP body to cap). OOM → `OOMKilled` → restart (repeatable transient DoS). Escalation: an attacker who stops just short of OOM leaves a room persisting a huge SGF that is slow/again-fatal to reload (ties into M-12).
+- **Fix:** advance `current` into the pasted branch (or forbid paste onto an ancestor of the clipboard), and enforce a per-room node cap (shared with H-7).
+
 ---
 
 ## 4. High findings
@@ -196,6 +209,14 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 
 ### H-8 — OGS fd + goroutine leak on every `request_sgf` · insp.
 - **Location:** `pkg/room/plugin/ogs.go:204` — `End()`/`closeOGS` set `o.Exit=true` but never call `o.Socket.Close()`. After deregister, `readSocketToChan` stays parked in `Socket.Read` and `loop` on `<-socketchan`; `Exit` cannot wake them. Net leak per event: **2 goroutines + 1 TCP fd** to online-go.com, unthrottled. **Behind proxy / K8s:** conditional on OGS egress; leak → OOM/fd-exhaustion → restart. **Fix:** `o.Socket.Close()` in `End()`; read deadline; cap connectors per room.
+
+### H-9 — OGS gamedata→SGF assertion cascade crashes the read-loop goroutine · PoC `1c`‡ (`go test`)
+- **Location:** `pkg/room/plugin/ogs.go:358-437` (`gamedataToSGF`/`gameInfoToSGF`/`initStateToSGF`) and the loop reader `ogs.go:264-318`, all executed inside `go o.loop(...)` (`ogs.go:198`).
+- **Mechanism:** the connector converts **online-go.com-controlled JSON** into SGF using dozens of *unchecked* type assertions — `gamedata["width"].(float64)`, `players["black"].(map[string]any)`, `blackPlayer["rank"].(float64)`, `initState["black"].(string)`, `move[0].(float64)`, `arr[0].(string)`, … — with no `, ok` guard. Any shape the code does not expect panics. Because the panic is in a **plugin-spawned goroutine** (not the request goroutine), `net/http`'s per-request `recover()` does **not** catch it → the panic aborts the whole process (**whole-server crash**; Critical-class when OGS is active — same boundary as C-1).
+- **Attacker control:** the attacker chooses which OGS game/review the (open) room attaches to via an unauthenticated `request_sgf`/connect with an `online-go.com` URL, and therefore controls the gamedata shape. A **rengo (team) game** — public and common, where `players.black` is null or an array rather than `{username, rank}` — is enough; so is a game missing `width`, or a truncated socket frame.
+- **Reproduced:** `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` feeds 10 attacker-reachable shapes (rengo null/array player, missing/`string` width, missing players, null komi, missing rules/initial_state, short/`string` move) straight to the unexported conversion path — **all panic**; a well-formed 1v1 control does not. (Delivering it end-to-end needs live egress to online-go.com; the test reproduces the fatal panic deterministically without it.)
+- **Behind proxy / K8s:** conditional on OGS egress being enabled; then Yes — crash → restart (repeatable transient DoS). Distinct root cause from C-1 (which is `Board.Set` nil/OOB on an off-board review move); both live in OGS goroutines.
+- **Fix:** comma-ok every assertion on OGS JSON and bail out (drop the message / disconnect) on a mismatch; wrap `o.loop` in a `recover()` that tears the connector down instead of crashing; treat `ogs.go` as an untrusted-input parser.
 
 ---
 
@@ -235,6 +256,12 @@ A class of type-assertion / index panics on attacker JSON that each **kill only 
 - `coord.FromInterface` (`coord.go:249`, `int(v.(float64))`) and `remove_mark value[:2]` (`commands.go:256`) on crafted command args — PoC `m7`.
 
 **Behind proxy / K8s:** Per-conn (no shared/prod impact). **Fix:** comma-ok every assertion on client input; bounds-check slice indices; treat `handlers.go`/`command_decoder.go` as untrusted-input parsers.
+
+### M-11 — `update_settings` size >19 → room silently dropped on restart (persistent data loss) · PoC `sizepoison`
+`pkg/room/handlers.go:294` reads `size` with **no bounds check** and, when it differs from the current size, does `SetState(state.NewState(size))` — and `NewState` does **not** clamp. A size of `20` costs trivial memory (this is *not* C-5's huge-size OOM), so the change succeeds silently and the room persists as `SZ[20]`. On the next restart `Hub.Load → room.Load → state.FromSGF` **rejects** any `size > 19` (`state.go:196`, `"unsupported board size"`), so `Hub.Load` logs `"failed to load room"` and `continue`s past it (`hub.go:172-175`): the room's entire persisted history is **destroyed**. `authorized` is a no-op on an open (default) room, so this is unauthenticated. Reproduced (`sizepoison`): after an unauth `update_settings{size:20}` the room serializes to `…SZ[20])` and `FromSGF` on that blob returns `unsupported board size`. **Behind proxy / K8s:** Yes, and it is a `⚑` persistent effect — the damage lands *on* the restart, so an in-memory single replica loses the room permanently (and a fresh empty room can then take its ID). **Fix:** bounds-check `size` (e.g. reject `size < 1 || size > 19`) in `handleUpdateSettings`, and make `NewState`/`FromSGF` agree on the allowed range.
+
+### M-12 — `FromSGF`/paste are O(N²) → single-upload CPU DoS · PoC `sgfquad`
+`pkg/state/util.go:119` (`computeDiffSetup`) calls `gotoIndex` (`pkg/state/nav.go:52`) for **every** setup node, and `gotoIndex` rewinds to the root and walks forward one node at a time (`O(depth)` per node). A linear chain of N setup nodes is therefore `O(N²)` to build — and `FromSGF` builds exactly such a chain from an SGF of empty `;` nodes. Reproduced (`sgfquad`): 1000/2000/4000/8000 empty nodes take ~0.09/0.4/1.9/10.2 s — ~4× per doubling, i.e. quadratic. A ~20 000-node SGF is only ~20 KB (well under the 1 MB `upload_sgf` cap) yet pins one CPU core for ~1 min; a few parallel uploads pin every core (request-path CPU exhaustion). The same rewind-walk also makes `paste`/reindex superlinear. **Behind proxy / K8s:** Yes via the tunneled WebSocket (the 20 KB body is far under any HTTP cap), `↻` (ties up workers, no crash). Unauthenticated on any open room. **Fix:** track the current board incrementally during load instead of re-deriving it with a root-rewind per node; cap node count per upload.
 
 ---
 
@@ -350,6 +377,12 @@ The ~7,200-line frontend (`pkg/frontend/js`) renders user data broadcast to ever
 - **L-8 — Predictable `math/rand` room names** (`pkg/core/util.go`): rooms are unauthenticated and world-readable, so names are guessable/enumerable. Use `crypto/rand` if names are meant to be unguessable.
 - **L-9 — bcrypt on every `checkpassword`** (`handlers.go`): no rate limit → CPU-amplification. Rate-limit auth attempts per IP/connection.
 
+**Deep-dive residue (last pass — confirmed Low / plausible-unconfirmed).** These came out of the "any other crash/room/data surface" sweep; they are recorded for completeness and did not warrant a Medium+ PoC:
+- **L-10 — `MemoryLoader` is not mutex-protected** (`pkg/loader/memoryloader.go:17`): `rooms`/`twitch` maps and the `messages` slice are read/written from every room goroutine + the persist loop with **no lock** → `fatal error: concurrent map …` (whole-server, unrecoverable). **Low only because it is memory-mode-only** — the assessed production posture uses a sqlite/postgres loader (concurrency-safe via `database/sql`). *If the in-memory loader is ever the configured backend, this is a Critical-class unauthenticated crash* (two clients creating rooms concurrently). Fix: guard the loader with a `sync.Mutex`, or don't run memory mode in production.
+- **L-11 — `GET /api/stats` is unauthenticated** (`pkg/hub/apirouter.go:45`): returns live room + connection counts to anyone (occupancy oracle). Same handler is the lock-contention lever in DL-1. Fix: gate it or drop it.
+- **L-12 — Twitch `!setboard`/`!branch` remap a room from chat** (`pkg/hub/twitchrouter.go:211-235`): a broadcaster's chat command re-points/branches a room. Grants **no new capability** — rooms are already world-writable over the WS — and needs the Twitch integration active (and, absent H-5, a valid signature). Fix follows H-5/M-7 (verify-before-act, fail-closed).
+- **Plausible, not confirmed (no PoC):** other OGS frame-reader assertions beyond `gamedata` (`ogs.go:264-318`, same class as H-9); `tree.Copy` recursion on a *deep linear* tree (subsumed by C-3/C-4, which overflow on parse/serialize first); a persisted deep tree re-overflowing `parseBranch` in `Hub.Load` (narrow — the upload path overflows before it can be saved, so only the graft-built path could persist one); a stale `PreferredChild` index surviving reload. Each is a candidate for a follow-up pass but none is a demonstrated exploit here.
+
 ---
 
 ## 9. Not exploitable / mitigated
@@ -375,12 +408,12 @@ Documented so a re-audit does not re-raise them:
 ## 11. Remediation priority
 
 1. **Fix the XSS (highest impact for embedding).** Set `textContent` (not `innerHTML`) at **both** label sinks `boardgraphics.js:516` and `:540` (and pass `String(i)` on the numeric branch in `place_label`) — XSS-1/XSS-1b; render error/info/prompt modal messages as text nodes at `modals.js:183/211/219` and stop broadcasting raw error strings — XSS-2; set `Content-Type: text/plain` + `nosniff` and verify-before-echo on the Twitch challenge (`twitchrouter.go:151`) — XSS-3; and add a `Content-Security-Policy` + security-headers middleware (CJ-1). These are the ones that compromise your website's visitors.
-2. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
+2. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` and comma-ok every OGS `gamedata` assertion (C-1/H-9); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); make `paste` advance `current` (or reject paste onto an ancestor) + a per-room node cap to kill the exponential copy/paste OOM (C-8); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
 2. **Fix the concurrency model.** Never hold `r.mu`/`h.mu` across a socket write — snapshot connections, unlock, then write; add per-write deadlines and drop slow clients (DL-1/DL-2/DL-3). Deep-copy field slices marshaled outside the lock (DR-2/DR-3); atomic/locked `OGSConnector.Exit` (DR-4).
 3. **Fix authorization.** Stop trusting client `userid` on `/api/v1` — bind identity to a server-issued token (AZ-1/AZ-3); clear `auth` on `SetPassword` and re-require `checkpassword` (AZ-2); authenticate/limit `POST /api/v1/room` + `MaxBytesReader` (C-7); add `authorized`+`outsideBuffer` to `graft` (H-6); validate `Origin` (H-1).
 4. **Stop the leaks.** End plugins in `Room.Close` (GL-1) and fix the OGS channel-send/socket-close (GL-2/H-8); room/connection/rate caps + shorter heartbeat (H-2/H-3/M-6); prune `auth`/`notified` maps (M-4); Postgres pool bounds (GL-3).
 5. **Secrets, integrations & info leaks.** Implement `dbConfig.redact()` (CS-1) and propagate the bcrypt error (CS-2); fail-closed on empty Twitch secret + verify-before-challenge (H-5/M-7); gate `/debug` (M-1) and the read/connect path if rooms are meant to be private (ID-1); return generic error messages and `json.Marshal` responses (ID-2/ID-3/ID-4/ID-5); redirect-revalidating fetch client + egress `NetworkPolicy` (M-2).
-6. **Robustness & hardening.** Comma-ok all client-input assertions + escape `\` in serializers (M-10/M-5); Low items L-1…L-9; the deployment hardening implied by the K8s model (non-root, secrets, single-instance or shared state, egress policy).
+6. **Robustness & hardening.** Comma-ok all client-input assertions + escape `\` in serializers (M-10/M-5); bounds-check `update_settings` size so a `SZ[20]` room can't be silently dropped on restart (M-11); make SGF load track the board incrementally instead of a root-rewind per node, killing the O(N²) upload (M-12); Low items L-1…L-12; the deployment hardening implied by the K8s model (non-root, secrets, single-instance or shared state, egress policy).
 
 ---
 
@@ -391,6 +424,6 @@ go build -o /tmp/board ./cmd && /tmp/board -f config/config-memory.yaml   # disp
 go run ./security/poc/harness <id> [-target localhost:8080]                # one id per finding
 ```
 
-Run with no arguments for the full list of harness commands. Data races use `go test -race ./security/poc/race/`. **Browser PoCs** (need Node + Playwright + Chromium, and the server running): `node security/poc/browser/xss_label.js` (stored XSS) and `node security/poc/browser/clickjacking.js`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
+Run with no arguments for the full list of harness commands (the newest additions: `copybomb` C-8, `sizepoison` M-11, `sgfquad` M-12 — all local-only, no target needed). Data races use `go test -race ./security/poc/race/`; the OGS gamedata crash (H-9) uses `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/`. **Browser PoCs** (need Node + Playwright + Chromium, and the server running): `node security/poc/browser/xss_label.js` (stored XSS) and `node security/poc/browser/clickjacking.js`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
 
 *Caveats: line numbers reference the repository at assessment time; dynamic validation ran against the default in-memory config; items marked `insp.` are confirmed by code inspection rather than a runnable exploit.*

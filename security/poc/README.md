@@ -17,10 +17,11 @@ go run ./security/poc/harness <id> [-target localhost:8080] [-origin url]
 
 Run with no arguments for the list.
 
-- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1` (`h6` verifies a *mitigation*).
+- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 b2 copybomb sizepoison sgfquad m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1` (`h6` verifies a *mitigation*).
 - **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3`.
 - **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3.
-- `b1` also runs end-to-end with `-target` (uploads the poison; then join the room to see it brick).
+- **Go test** (separate): `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` reproduces H-9 (OGS gamedata assertion cascade).
+- `b1`/`b2` also run end-to-end with `-target` (upload the poison; then join the room to see it brick).
 
 ## Command → finding map
 
@@ -31,6 +32,10 @@ authoritative list and status).
 | Command | Report ID | What it demonstrates |
 |---------|-----------|----------------------|
 | `a1` | C-1 | `Board.Set` nil/OOB → whole-server crash via the OGS review goroutine (not recovered). Local: fatal `Board.Move` panic. |
+| `copybomb` | C-8 | Copy/paste **exponential** state amplification — each `copy`+`clipboard` pair doubles the tree (`current` never advances) → 2ᵏ nodes → OOM. Drives the real handler chain; shows exact doubling to 2¹⁸. |
+| `sizepoison` | M-11 | `update_settings size>19` persists `SZ[20]`; `FromSGF` rejects it on restart → room **silently dropped** (unauthenticated persistent data loss, trivial RAM). |
+| `sgfquad` | M-12 | `FromSGF` is **O(N²)** (`gotoIndex` rewind-walk per setup node) → a ~20 KB upload of empty `;` nodes pins a core ~1 min. Prints the quadratic scaling. |
+| `go test …TestOGSGamedataCrash_1c` | H-9 | OGS `gamedata`→SGF assertion cascade: rengo/malformed gamedata panics the OGS read-loop goroutine (unrecovered → whole-server crash). 10 shapes panic, control passes. |
 | `b1` | C-2 | Colon-less `LB` label → **persistent poison-pill**, board bricked on every load, survives restart (`frame.go:131`). |
 | `c6` | C-3 | Deeply nested SGF → `parseBranch` **stack overflow** (whole-server crash). |
 | `h7` | C-4 | Deep linear tree → `toSGF` **stack overflow** via `Merge` (whole-server crash). |
