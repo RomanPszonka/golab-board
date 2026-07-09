@@ -19,8 +19,9 @@ Run with no arguments for the list.
 
 - **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 b2 copybomb sizepoison sgfquad m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1` (`h6` verifies a *mitigation*).
 - **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3`.
-- **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3.
+- **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3 and L-10 (the `MemoryLoader` concurrent-map crash — `TestL10`, `//go:build race` so it only runs under `-race`).
 - **Go test** (separate): `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` reproduces H-9 (OGS gamedata assertion cascade).
+- **Fuzzing** (separate): `go test -run x -fuzz FuzzSGFPipeline ./pkg/state/` drives the full `FromSGF → GenerateFullFrame → serialize → reload` pipeline and re-finds the C-2b mark poison-pill in seconds — the surface the parser-only fuzzers (`FuzzFromSGF`/`FuzzSGFParser`) never reach.
 - `b1`/`b2` also run end-to-end with `-target` (upload the poison; then join the room to see it brick).
 
 ## Command → finding map
@@ -63,6 +64,8 @@ authoritative list and status).
 | `az2` | AZ-2 | Setting a password grandfathers an idling attacker's connection (`SetAuthAll`). |
 | `cs1` | CS-1 | The Postgres DSN password survives `Config.Redact()` (a no-op for `db`) and is logged at startup. |
 | `go test -race ./security/poc/race/` | DR-2 / DR-3 | Torn-read races: the full-frame / `Current().AllFields()` are read outside `r.mu` while fields mutate under it (race detector fires). |
+| `go test -race -run TestL10 ./security/poc/race/` | L-10 | `MemoryLoader` has no mutex: `SaveRoom`/`DeleteRoom` vs `LoadAllRooms` is an unsynchronized map access → `DATA RACE` / `fatal error: concurrent map …` (memory-mode only). |
+| `go test -run x -fuzz FuzzSGFPipeline ./pkg/state/` | C-2b (tooling) | Full parse→render→reload fuzzer; re-finds the `TR`/`SQ`/`LB` mark nil-deref in <5 s. The parser-only fuzzers never call `GenerateFullFrame`, so they miss it. |
 | `nick` | M-3 | `update_nickname` sets a 200 KB nick on a **password** room, unauthenticated — no auth gate, no cap. |
 | `authleak` | M-4 | 5 authed connections disconnect → all 5 stay authorized (auth map never pruned). |
 | `sgfesc` | M-5 | A label ending in `\` swallows the following `PB` field on reload (escaping not round-trip safe). |

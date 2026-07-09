@@ -193,3 +193,53 @@ func FuzzFromSGF(f *testing.F) {
 		_, _ = state.FromSGF(orig)
 	})
 }
+
+// FuzzSGFPipeline exercises the FULL untrusted-SGF pipeline that a real upload
+// travels — parse, RENDER, persist, and RELOAD — not just the parser. This
+// matters because every SGF poison-pill in this codebase (a colon-less `LB`
+// label, an empty/1-char/compressed `TR` or `SQ` mark, a text field left
+// un-round-trip-safe by the `]`-only escaping) PARSES cleanly and only crashes
+// *later*: in GenerateFullFrame (`frame.go` `generateMarks`) or after a
+// serialize→reparse cycle (exactly what Hub.Save/Hub.Load do on every restart).
+// The parser-only targets above (FuzzFromSGF / FuzzSGFParser) never reach those
+// sinks, which is why they ran millions of execs clean while the bugs sat live.
+//
+// Search with:  go test -run x -fuzz FuzzSGFPipeline ./pkg/state/
+// (a crasher is written under testdata/fuzz/). The seed corpus is deliberately
+// benign so the normal, non-`-fuzz` `go test` stays green.
+func FuzzSGFPipeline(f *testing.F) {
+	seeds := []string{
+		"(;)",
+		"(;GM[1]FF[4]SZ[19])",
+		"(;GM[1]SZ[9];B[aa];W[bb];B[];W[ss])",
+		"(;GM[1]FF[4]SZ[19]C[a comment];B[aa]TR[bb][cc]SQ[dd]LB[ee:label])",
+		"(;GM[1]FF[4]SZ[19]AB[aa][bb]AW[cc]AE[dd])",
+		"(;GM[1]FF[4]SZ[19]PX[1.0:2.0:3.0:4.0:red])",
+		sgfsamples.SimpleTwoBranches, sgfsamples.SimpleWithComment,
+		sgfsamples.SimpleEightMoves, sgfsamples.Scoring1, sgfsamples.ChineseNames,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, orig string) {
+		s, err := state.FromSGF(orig)
+		if err != nil || s == nil {
+			return
+		}
+		// (1) RENDER — the mark sinks (TR/SQ/LB) fire here, never in the parser.
+		for _, ty := range []state.TreeJSONType{state.Full, state.CurrentOnly} {
+			_ = s.GenerateFullFrame(ty)
+		}
+		// (2) PERSIST → RELOAD → render again. The `]`-only escaping means a
+		// value that survived (1) can still corrupt or crash on reload — this is
+		// the Hub.Save/Hub.Load restart path that turns a bug into a poison-pill.
+		for _, sgf := range []string{s.ToSGF(), s.ToSGFIX()} {
+			s2, err := state.FromSGF(sgf)
+			if err != nil || s2 == nil {
+				continue
+			}
+			_ = s2.GenerateFullFrame(state.Full)
+		}
+	})
+}
