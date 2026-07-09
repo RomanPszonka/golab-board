@@ -10,7 +10,7 @@
 
 Every client is anonymous and can open a WebSocket, create rooms, upload files, and drive board state — a large, fully **unauthenticated** attack surface. The findings fall into these groups:
 
-- **Whole-server crashes (8 Critical).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb → OOM), a **panic in a spawned goroutine** (the OGS review plugin, which `net/http` does not recover), or a **concurrent-map data race** (`fatal error: concurrent map iteration and map write` via the nicknames map — also not recoverable). All were reproduced.
+- **Whole-server crashes (8 Critical) + one stored-XSS Critical (9 total).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb → OOM), a **panic in a spawned goroutine** (the OGS review plugin, which `net/http` does not recover), or a **concurrent-map data race** (`fatal error: concurrent map iteration and map write` via the nicknames map — also not recoverable). All were reproduced.
 - **One unrecoverable board (persistent poison-pill).** A crafted label (`LB[z]`) is committed and persisted, then panics on every load — the board is permanently unjoinable and the poison **survives restarts** (see C-2).
 - **Concurrency: data races & lock-held-during-I/O (§6).** Beyond the crash race, several torn-slice races (`fatal`/SIGSEGV) and — confirmed — **one stuck-reading client freezes an entire room** because `Broadcast` holds `r.mu` across the blocking socket write (escalating hub-wide via `SendMessages`).
 - **Authorization bypass (§6).** The `/api/v1` HTTP path trusts the client-supplied `userid`, so an attacker can replay an authenticated occupant's connection UUID and take over a **password-protected** room; and enabling a password grandfathers every currently-connected (incl. hostile) socket.
@@ -42,6 +42,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | C-5 | Critical | Board-size memory exhaustion (`update_settings` size unbounded) | PoC `c3` | Yes ↻ |
 | C-6 | Critical | ZIP bomb — unbounded in-memory decompression | PoC `c5` | Yes (WS) ↻ |
 | C-7 | Critical | Unauthenticated state control + crash delivery (`POST /api/v1/room`, uncapped `upload_sgf` array branch) | PoC `c7` | Yes / Partly |
+| XSS-1 | Critical | Stored XSS via board labels (SVG `<text>.innerHTML`) — arbitrary JS in every viewer, in the embedding site's origin | PoC `xss_label.js` | Yes |
 | H-1 | High | No WebSocket `Origin` check → cross-site WebSocket hijacking (CSWSH) | PoC `h1` | Yes |
 | H-2 | High | Unbounded room creation | PoC `h2` | Yes |
 | H-3 | High | No connection / rate limits | PoC `h3` | Partly |
@@ -90,10 +91,11 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | AZ-4 | Low | `GetAuth` returns key-existence → `SetAuth(id,false)` revocation is a silent no-op | insp. | Per-conn |
 | ID-4 | Low | `ApprovedFetch` allowlist-enumeration oracle + requested-host reflection | PoC `id3` | Yes |
 | ID-5 | Low | Twitch OAuth callback echoes internal client errors | insp. | Cond. |
+| CJ-1 | Medium | No `X-Frame-Options` / CSP → clickjacking + no XSS backstop (embedding use case) | PoC `clickjacking.js` | Yes |
 
 **Remaining `insp.` findings** are either configuration facts (M-6 the 1-hour heartbeat constant; M-9 the missing `http.Server` timeouts) or require live egress to `online-go.com` to reproduce at runtime (H-8 socket-close, DR-4, GL-2, ID-2); their root causes are confirmed in source and, where applicable, by a related PoC (`gl1`, `id3`).
 
-**Not exploitable / mitigated** (documented so they are not re-raised): NGF/SGF oversized-board OOM (clamped by `FromSGF`), `remove_mark value[:2]` and the GIB `alphabet[x]` panic (recovered per-connection; GIB is never persisted). See [§8](#8-not-exploitable--mitigated).
+**Not exploitable / mitigated** (documented so they are not re-raised): NGF/SGF oversized-board OOM (clamped by `FromSGF`), `remove_mark value[:2]` and the GIB `alphabet[x]` panic (recovered per-connection; GIB is never persisted). See [§9](#9-not-exploitable--mitigated).
 
 ---
 
@@ -287,7 +289,26 @@ These are the results of a dedicated review of issue classes beyond DoS/parsing.
 
 ---
 
-## 7. Low findings / hardening
+## 7. Client-side (frontend) & HTTP headers
+
+The ~7,200-line frontend (`pkg/frontend/js`) renders user data broadcast to every room participant. The obvious sinks are escaped (nicknames and comments use the `textContent`→`innerHTML` trick; player names use `htmlencode`, `common.js:162`), but board **labels** are not — and no HTTP security headers are set. (A broader client-side sweep is ongoing; additional findings will be added here.)
+
+### XSS-1 — Stored XSS via board labels · **Critical** · PoC `security/poc/browser/xss_label.js` (reproduced in Chromium)
+- **Sink:** `pkg/frontend/js/boardgraphics/boardgraphics.js:516` — `text.innerHTML = txt` on an SVG `<text>` element, reached from `draw_custom_label` → `draw_centered_text` → `svg_draw_centered_text` with the **raw** label text (no escaping on this path, unlike nicknames/comments/player-names).
+- **Source / delivery (unauthenticated):** a `label` event (`{"event":"label","value":{"coords":[x,y],"label":"<payload>"}}`) over the WebSocket **or** the unauthenticated `POST /api/v1/room/{id}`, or an uploaded SGF with a crafted `LB` field. The label is broadcast to all participants and **persisted in room state**, so it re-fires on every future connect.
+- **Payload:** `<img src=x onerror="/* attacker JS */">` (SVG `<text>.innerHTML` executes injected event handlers — confirmed for `<img onerror>`, `<foreignObject>`, `<animate onbegin>`, `<set onbegin>`).
+- **Impact:** arbitrary JavaScript in **every** viewer's browser, **in the origin the board is embedded in**. For the intended "board on my website" use, this is full compromise of any visitor's session on that site (session/cookie theft, defacement, request forgery, pivot). Persisted → affects everyone who later opens the room.
+- **Verified:** end-to-end in real Chromium — an API-injected label executed `onerror` in a victim board page (`window.__xss` was set to the page origin).
+- **Fix:** escape the label text (use `textContent` / the existing `htmlencode`, or set `text.textContent = txt`) in `svg_draw_centered_text`; never assign untrusted strings to `innerHTML`. Add a CSP (below) as defense-in-depth.
+
+### CJ-1 — No framing protection (clickjacking) & no CSP · **Medium** · PoC `security/poc/browser/clickjacking.js`
+- **Location:** `pkg/app/app.go` — the middleware chain is only `StripSlashes` + the request logger; no security-header middleware anywhere.
+- **Detail:** responses set **no `X-Frame-Options`, no `Content-Security-Policy`**, no `X-Content-Type-Options`, no `Referrer-Policy`. Confirmed by response headers (only `Content-Type` is set). Any site can iframe the board (clickjacking / UI-redress), and the absent CSP means there is no second layer to blunt XSS-1. This is especially relevant because the board is meant to be embedded in a third-party site.
+- **Fix:** add a headers middleware setting `Content-Security-Policy` (at least `default-src 'self'`; note the app currently pulls Bootstrap from a CDN, so allow that host or vendor it), `X-Frame-Options`/`frame-ancestors` scoped to the embedding site(s), `X-Content-Type-Options: nosniff`, and a `Referrer-Policy`.
+
+---
+
+## 8. Low findings / hardening
 
 - **L-1 — `GET /ext/upload` has side effects** (`pkg/hub/extrouter.go`): creates a room and triggers a server-side fetch → CSRF-able. Make it POST with CSRF protection.
 - **L-2 — Missing security headers** (`pkg/app/app.go`): no CSP/`X-Frame-Options`/`X-Content-Type-Options`/`Referrer-Policy`. Add a headers middleware (templates already auto-escape via `html/template`).
@@ -301,7 +322,7 @@ These are the results of a dedicated review of issue classes beyond DoS/parsing.
 
 ---
 
-## 8. Not exploitable / mitigated
+## 9. Not exploitable / mitigated
 
 Documented so a re-audit does not re-raise them:
 - **Oversized board via NGF/SGF upload** — the NGF parser only stores `size` as a string; the sole path to `NewBoard` from parsed SGF/NGF is `state.FromSGF`, which **clamps `size > 19`** (`state.go:196`) and errors before allocating. Verified: `FromSGF("(;SZ[50000])")` → `"unsupported board size"`. (The unclamped board-size DoS is C-5, via `update_settings`.)
@@ -310,7 +331,7 @@ Documented so a re-audit does not re-raise them:
 
 ---
 
-## 9. Reviewed and clean (positives)
+## 10. Reviewed and clean (positives)
 
 - Passwords hashed with **bcrypt** and compared in constant time (`pkg/core/verify.go`).
 - **SQL fully parameterized** (`pkg/loader/dbloader.go`) — no injection. (Portability nit: `dbloader.go:382` uses double-quoted string literals that break on Postgres.)
@@ -321,9 +342,10 @@ Documented so a re-audit does not re-raise them:
 
 ---
 
-## 10. Remediation priority
+## 11. Remediation priority
 
-1. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
+1. **Fix the stored XSS (highest impact for embedding).** Escape the label text in `svg_draw_centered_text` (`boardgraphics.js:516`) — use `textContent`/`htmlencode`, never `innerHTML` for untrusted data — and add a `Content-Security-Policy` + `X-Frame-Options` headers middleware (XSS-1, CJ-1). This is the one that compromises your website's visitors.
+2. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
 2. **Fix the concurrency model.** Never hold `r.mu`/`h.mu` across a socket write — snapshot connections, unlock, then write; add per-write deadlines and drop slow clients (DL-1/DL-2/DL-3). Deep-copy field slices marshaled outside the lock (DR-2/DR-3); atomic/locked `OGSConnector.Exit` (DR-4).
 3. **Fix authorization.** Stop trusting client `userid` on `/api/v1` — bind identity to a server-issued token (AZ-1/AZ-3); clear `auth` on `SetPassword` and re-require `checkpassword` (AZ-2); authenticate/limit `POST /api/v1/room` + `MaxBytesReader` (C-7); add `authorized`+`outsideBuffer` to `graft` (H-6); validate `Origin` (H-1).
 4. **Stop the leaks.** End plugins in `Room.Close` (GL-1) and fix the OGS channel-send/socket-close (GL-2/H-8); room/connection/rate caps + shorter heartbeat (H-2/H-3/M-6); prune `auth`/`notified` maps (M-4); Postgres pool bounds (GL-3).
@@ -332,13 +354,13 @@ Documented so a re-audit does not re-raise them:
 
 ---
 
-## 11. Running the PoCs
+## 12. Running the PoCs
 
 ```
 go build -o /tmp/board ./cmd && /tmp/board -f config/config-memory.yaml   # disposable target on :8080
 go run ./security/poc/harness <id> [-target localhost:8080]                # one id per finding
 ```
 
-Run with no arguments for the list. **Local-only** (no server): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2`. **Need `-target`:** `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
+Run with no arguments for the full list of harness commands. Data races use `go test -race ./security/poc/race/`. **Browser PoCs** (need Node + Playwright + Chromium, and the server running): `node security/poc/browser/xss_label.js` (stored XSS) and `node security/poc/browser/clickjacking.js`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
 
 *Caveats: line numbers reference the repository at assessment time; dynamic validation ran against the default in-memory config; items marked `insp.` are confirmed by code inspection rather than a runnable exploit.*
