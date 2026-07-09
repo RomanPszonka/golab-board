@@ -38,6 +38,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 |----|-----|---------|--------------|--------------------|
 | C-1 | Critical | Whole-server crash via the OGS review plugin goroutine (`Board.Set` nil/OOB + unchecked assertions, not recovered) | PoC `a1` | Cond.(OGS) → Yes ↻ |
 | C-2 | Critical | Persistent poison-pill: colon-less `LB` label bricks a board on every load | PoC `b1` | Yes ⚑ |
+| C-2b | High | Persistent poison-pill: empty/invalid `TR`/`SQ` mark → nil-deref in `GenerateFullFrame` (sibling of C-2; found by fuzzing) | PoC `b2` | Yes ⚑ |
 | C-3 | Critical | SGF parse stack overflow (unbounded `parseBranch` recursion) | PoC `c6` | Yes (WS) ↻ |
 | C-4 | Critical | Tree-serialize stack overflow (`toSGF`/`Copy` recursion via `Merge`) | PoC `h7` | Yes (WS) ↻ |
 | C-5 | Critical | Board-size memory exhaustion (`update_settings` size unbounded) | PoC `c3` | Yes ↻ |
@@ -55,7 +56,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | H-6 | High | `graft` handler bypasses `authorized` + rate-limit middleware | PoC `graft` | Yes |
 | H-7 | High | Unbounded per-room tree growth + quadratic full-frame rebroadcast | PoC `grow` | Yes ↻ |
 | H-8 | High | OGS plugin fd + goroutine leak on every `request_sgf` | PoC `gl1`* | Cond.(OGS) ↻ |
-| M-1 | Medium | `/debug` leaks full room state unauthenticated (incl. password rooms) | PoC `m3` | Yes |
+| M-1 | Medium | `/debug`, `/sgf`, `/sgfix` download a **password-protected** room's full game/state with no password | PoC `m3` | Yes |
 | M-2 | Medium | SSRF via redirect-following + untimed/unbounded fetch | PoC `m4` | Cond.; high in K8s |
 | M-3 | Medium | `update_nickname` no auth / no length cap → N² rebroadcast | PoC `nick` | Yes |
 | M-4 | Medium | Unbounded per-room `auth`/`notified` maps (never pruned) | PoC `authleak` | Yes |
@@ -120,6 +121,11 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 - **Reproduced:** `b1` — `FromSGF` OK, then `GenerateFullFrame` → `index out of range [1] with length 1`.
 - **Behind proxy / K8s:** tiny payload passes any cap; poison lives in the **shared DB**, so **auto-restart reloads it** — the standout under this model, because self-healing does not help.
 - **Fix:** `if len(spl) != 2 { continue }` at `frame.go:131`; validate `LB` values in `FromSGF` so malformed marks are never committed or persisted.
+
+### C-2b — Persistent poison-pill via empty/invalid `TR`/`SQ` marks · **High** (Critical if OGS active) · PoC `b2`
+- **Sink:** `pkg/state/frame.go:112/121` — `generateMarks` does `cs.Add(coord.FromLetters(v))` for the `TR` and `SQ` mark fields; `coord.FromLetters` returns **nil** for any value whose length ≠ 2 (`coord.go`), and `CoordSet.Add` derefs `c.Index()` with **no nil-check** (`coord.go:44`) → nil-pointer dereference.
+- **Delivery (unauthenticated):** upload an SGF whose current node has an empty or malformed mark — `(;SZ[19]SQ[])`, `(;TR[])`, `(;SQ[!])`, `(;TR[dd][])`. `FromSGF` accepts it and `UploadSGF` commits the state **before** frame generation; `ToSGFIX` writes the bad mark back, so it **persists** and re-bricks the room on every join/reload. Same escalation as C-2: whole-server crash if the room's OGS plugin is active (`GenerateFullFrame` runs in the OGS goroutine). Found by fuzzing `state.FromSGF` (8 s to first crash); a further 1.7 M-exec sweep found no third frame-generation crash beyond this and C-2.
+- **Fix:** nil-check in `CoordSet.Add` (and skip nil coords in `generateMarks`); validate `TR`/`SQ`/`LB` values in `FromSGF` so malformed marks are never committed or persisted. (The single `CoordSet.Add` guard closes the whole `FromLetters`→`Add` family.)
 
 ### C-3 — SGF parse stack overflow (unbounded recursion) · PoC `c6`
 - **Location:** `pkg/core/parser/sgfparser.go:214` — `parseBranch` recurses once per `(` with no depth cap.
@@ -195,8 +201,8 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 
 ## 5. Medium findings
 
-### M-1 — `/debug` leaks full room state unauthenticated · PoC `m3`
-`pkg/hub/webrouter.go` exposes `GET /b/{id}/debug` → `SaveState()` JSON (SGF, location, prefs) for **any** room, including password-protected ones, with no auth. Reproduced (`m3`). **Behind proxy / K8s:** Yes (normal GET), unless ops explicitly block the path. **Fix:** gate behind test mode or remove it.
+### M-1 — `/debug`, `/sgf`, `/sgfix` leak a password-protected room's full game/state · PoC `m3`
+`pkg/hub/webrouter.go` `HandleOp` serves `GET /b/{id}/debug` → `SaveState()` JSON, `GET /b/{id}/sgf` → `ToSGF()`, and `GET /b/{id}/sgfix` → `ToSGFIX()` for **any** room with **no password check**. Reproduced: a room with `isprotected: true` (password `hunter2`) still returned its full game — player names, every move — via `/b/{id}/sgf` and its full `StateJSON` via `/debug`, to an unauthenticated caller. The password gates *writes* only (see ID-1); these HTTP download endpoints expose the *contents* of a "private" room to anyone with (or who guesses — see L-8) the room ID. **Behind proxy / K8s:** Yes (normal GETs), unless ops block the paths. **Fix:** gate `/debug` behind test mode; gate `/sgf`/`/sgfix` on the room password if rooms are meant to be private (or accept that rooms are world-readable and document it).
 
 ### M-2 — SSRF via redirect-following + untimed/unbounded fetch · PoC `m4`
 `internal/fetch` uses `http.DefaultClient` (follows redirects, no timeout) and `io.ReadAll`s the body (no size cap); `ApprovedFetch` checks only the **first** hop's hostname. Reproduced (`m4`): `Fetch` followed a redirect to an "internal" service. Reachability needs an open-redirect on an approved host (or the `OGSCheckEnded`/`FetchOGS` direct-`Fetch` paths). **Behind proxy / K8s:** this is an **egress** problem the ingress proxy does not touch; blast radius in K8s includes cluster-internal ClusterIP services and `169.254.169.254` (cloud IAM metadata). **Fix:** a client with a timeout and a redirect policy that re-validates each hop's host against the allow-list; `io.LimitReader` the body; add an egress `NetworkPolicy`.
