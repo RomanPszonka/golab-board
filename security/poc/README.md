@@ -17,8 +17,9 @@ go run ./security/poc/harness <id> [-target localhost:8080] [-origin url]
 
 Run with no arguments for the list.
 
-- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2` (`h6` verifies a *mitigation*).
+- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1` (`h6` verifies a *mitigation*).
 - **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1`.
+- **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3.
 - `b1` also runs end-to-end with `-target` (uploads the poison; then join the room to see it brick).
 
 ## Command → finding map
@@ -49,6 +50,14 @@ authoritative list and status).
 | `dr1` | DR-1 | Concurrent map iteration+write on `r.nicks` via `/api/v1` → `fatal error: concurrent map …` (whole-server crash, not recoverable). |
 | `dl2` | DL-2 | One slow-reading client freezes the whole room (`r.mu` held across the blocking socket write). |
 | `cs2` | CS-2 | Password > 72 bytes → `bcrypt` errors, `Hash` returns `""` → room silently open. |
+| `graft` | H-6 | `graft` mutates a **password-protected** room unauthenticated (no `authorized`/`outsideBuffer` middleware). |
+| `grow` | H-7 | Unbounded tree growth via graft (4000 grafts → 4200+ nodes) + full-frame re-serialized on every one. |
+| `gl1` | H-8 / GL-1 | `Room.Close` never `End()`s registered plugins → OGS goroutine/fd/room-graph leak (root cause). |
+| `dl1` | DL-1 | Stuck client + unauth `GET /api/stats` (`ConnCount`) pins `h.mu` → new connections/board loads wedge hub-wide. |
+| `az1` | AZ-1 | `/api/v1` trusts the client `userid`; replaying an authed occupant's UUID runs privileged handlers on a password room. |
+| `az2` | AZ-2 | Setting a password grandfathers an idling attacker's connection (`SetAuthAll`). |
+| `cs1` | CS-1 | The Postgres DSN password survives `Config.Redact()` (a no-op for `db`) and is logged at startup. |
+| `go test -race ./security/poc/race/` | DR-2 / DR-3 | Torn-read races: the full-frame / `Current().AllFields()` are read outside `r.mu` while fields mutate under it (race detector fires). |
 | `h6` | (mitigation) | Verifies the `FromSGF` `size>19` clamp — the NGF/SGF board-OOM path is **not** exploitable. |
 
 Findings verified by code inspection only (no runnable command) — H-6, H-7, H-8,

