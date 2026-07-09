@@ -8,11 +8,16 @@
 
 ## 1. Executive summary
 
-Every client is anonymous and can open a WebSocket, create rooms, upload files, and drive board state — a large, fully **unauthenticated** attack surface. The findings fall into four groups:
+Every client is anonymous and can open a WebSocket, create rooms, upload files, and drive board state — a large, fully **unauthenticated** attack surface. The findings fall into these groups:
 
-- **Whole-server crashes (7 Critical).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb → OOM), or a **panic in a spawned goroutine** (the OGS review plugin, which `net/http` does not recover). All were reproduced.
+- **Whole-server crashes (8 Critical).** A single unauthenticated request can abort the entire process via **unbounded recursion** (SGF parse / tree serialize → `fatal error: stack overflow`), **unbounded allocation** (board size, zip bomb → OOM), a **panic in a spawned goroutine** (the OGS review plugin, which `net/http` does not recover), or a **concurrent-map data race** (`fatal error: concurrent map iteration and map write` via the nicknames map — also not recoverable). All were reproduced.
 - **One unrecoverable board (persistent poison-pill).** A crafted label (`LB[z]`) is committed and persisted, then panics on every load — the board is permanently unjoinable and the poison **survives restarts** (see C-2).
-- **Resource-exhaustion and integrity issues (High/Medium).** No origin check (CSWSH), no room/connection/rate caps, missing timeouts, an unauthenticated `graft` handler, goroutine/fd leaks, SSRF, and an info-leaking `/debug` endpoint.
+- **Concurrency: data races & lock-held-during-I/O (§6).** Beyond the crash race, several torn-slice races (`fatal`/SIGSEGV) and — confirmed — **one stuck-reading client freezes an entire room** because `Broadcast` holds `r.mu` across the blocking socket write (escalating hub-wide via `SendMessages`).
+- **Authorization bypass (§6).** The `/api/v1` HTTP path trusts the client-supplied `userid`, so an attacker can replay an authenticated occupant's connection UUID and take over a **password-protected** room; and enabling a password grandfathers every currently-connected (incl. hostile) socket.
+- **Memory / goroutine / fd leaks (§6).** Room teardown never ends registered plugins; OGS reader goroutines can block forever on a channel send; unbounded per-room maps.
+- **Secrets & crypto (§6).** The Postgres DSN (with password) is logged in plaintext at startup; a password over 72 bytes silently disables room protection.
+- **Information disclosure (§6).** A "protected" room streams full state/moves to any anonymous socket; raw internal fetch errors (internal IPs/DNS, an SSRF oracle) are broadcast to clients and JSON-injected into `/api/v1` responses.
+- **Resource-exhaustion & integrity (High/Medium).** No origin check (CSWSH), no room/connection/rate caps, missing timeouts, an unauthenticated `graft` handler, SSRF, and an info-leaking `/debug` endpoint.
 - **Deployment hardening (Low).** Root container, committed default credentials, no security headers, no CI scanning.
 
 **Reading crash severity — the `net/http` recover boundary.** Go's `net/http` wraps each request in `recover()`, and the WebSocket handler runs *inside* that request goroutine. So a plain type-assertion/index panic reached from a request is **contained** — it drops one connection, not the server. Only three things abort the whole process: (a) **fatal runtime errors** (stack overflow, OOM), (b) panics in **`go`-spawned goroutines** (OGS plugin loop, heartbeat, message loop), and (c) a **persisted poison pill** re-triggered on reload. Findings are rated on that basis: unchecked-input panics on the request path are Medium (contained); the same defect in a spawned goroutine is Critical.
@@ -64,8 +69,29 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 | L-7 | Low | No dependency / security scanning in CI | insp. | n/a |
 | L-8 | Low | Predictable `math/rand` room names | insp. | Yes |
 | L-9 | Low | bcrypt on every `checkpassword` — CPU-amplification | insp. | Partly |
+| DR-1 | Critical | Data race: concurrent map iteration+write on `r.nicks` via `/api/v1` → fatal crash | PoC `dr1` | Yes ↻ |
+| DL-2 | High | Lock held during socket write: one slow reader freezes the whole room (and hub) | PoC `dl2` | Yes (hang) |
+| DL-1 | High | Hub holds `h.mu` across room calls: stuck client + `GET /api/stats` freezes the server | insp. | Yes (hang) |
+| AZ-1 | High | `/api/v1` trusts client `userid` → authz bypass / password-room takeover | insp. | Yes |
+| AZ-2 | High | Enabling a password grandfathers all connected (incl. hostile) sockets (`SetAuthAll`) | insp. | Yes |
+| GL-1 | High | `Room.Close` never ends plugins → OGS goroutine + fd + room-graph leak | insp. | Cond.(OGS) ↻ |
+| DR-2 | High | Initial full-frame marshaled outside `r.mu` (aliases tree slices) → torn read/SIGSEGV | insp. | Yes ↻ |
+| DR-3 | High | `Current().AllFields()` iterated outside `r.mu` during mutation → torn read | insp. | Cond. ↻ |
+| CS-1 | High | Postgres DSN (with password) logged in plaintext at startup | insp. | n/a (log access) |
+| CS-2 | Medium | Password > 72 bytes silently disables room protection | PoC `cs2` | n/a (owner footgun) |
+| DR-4 | Medium | `OGSConnector.Exit` read without lock (written under lock) | insp. | Cond.(OGS) |
+| GL-2 | Medium | `readSocketToChan` blocks forever on channel send after game-over → goroutine leak | insp. | Cond.(OGS) |
+| ID-1 | Medium | Password gates writes only — anon socket reads a protected room's full state/moves | insp. | Yes |
+| ID-2 | Medium | Raw internal fetch/parser errors broadcast to clients (internal IPs/DNS, SSRF oracle) | insp. | Yes |
+| ID-3 | Medium | Hand-rolled JSON on `/api/v1` interpolates raw error/value → JSON injection + infoleak | insp. | Yes |
+| DL-3 | Low | `Room.Close` holds `r.mu` across `conn.Close` → room/goroutine/fd leak on a stalled client | insp. | Cond. |
+| GL-3 | Low | Postgres pool bounds unset → transient connection exhaustion | insp. | n/a |
+| AZ-3 | Low | `outsideBuffer` throttle keyed on client `userid` (bypassable; not authz) | insp. | Yes |
+| AZ-4 | Low | `GetAuth` returns key-existence → `SetAuth(id,false)` revocation is a silent no-op | insp. | Per-conn |
+| ID-4 | Low | `ApprovedFetch` allowlist-enumeration oracle + requested-host reflection | insp. | Yes |
+| ID-5 | Low | Twitch OAuth callback echoes internal client errors | insp. | Cond. |
 
-**Not exploitable / mitigated** (documented so they are not re-raised): NGF/SGF oversized-board OOM (clamped by `FromSGF`), `remove_mark value[:2]` and the GIB `alphabet[x]` panic (recovered per-connection; GIB is never persisted). See [§7](#7-not-exploitable--mitigated).
+**Not exploitable / mitigated** (documented so they are not re-raised): NGF/SGF oversized-board OOM (clamped by `FromSGF`), `remove_mark value[:2]` and the GIB `alphabet[x]` panic (recovered per-connection; GIB is never persisted). See [§8](#8-not-exploitable--mitigated).
 
 ---
 
@@ -198,7 +224,68 @@ A class of type-assertion / index panics on attacker JSON that each **kill only 
 
 ---
 
-## 6. Low findings / hardening
+## 6. Extended review: concurrency, memory, crypto, authz & disclosure
+
+These are the results of a dedicated review of issue classes beyond DoS/parsing. Two facts of the runtime model apply throughout: a **data race that trips the Go runtime** (`concurrent map …`, torn slice header) is a **fatal error**, not a panic, so — like a stack overflow — `net/http` cannot recover it; and code that holds a mutex across a **blocking socket write** (there is **no write deadline anywhere** — empty `websocket.Config{}`, no `http.Server` timeouts) lets a single non-reading client stall every other holder of that lock.
+
+### Data races
+
+**DR-1 — Concurrent map iteration+write on `r.nicks` → fatal whole-server crash · Critical · PoC `dr1`**
+`handleUpdateNickname` returns `event.NewEvent("connected_users", r.Nicks())`, and `Room.Nicks()` (`room.go:237`) returns the **live** map, not a copy. The `/api/v1` handler then `json.Marshal`s that event at `apiv1router.go:27` **outside `r.mu`**, iterating the map, while a concurrent request's `SetNick` (`room.go:250`) writes it under the lock. Reproduced: a burst of concurrent `POST /api/v1/room/x {"event":"update_nickname",...}` (no auth on this handler) kills the server with `fatal error: concurrent map iteration and map write` — not recoverable. **Fix:** `Nicks()` returns a copy built under the lock; never marshal events that alias live room state.
+
+**DR-2 — Initial full-frame marshaled outside `r.mu`, aliasing tree field slices → torn read/SIGSEGV · High.** `RegisterConnection` (`room.go`) releases `r.mu`, then `SendEvent`→`json.Marshal` walks `Metadata.Fields`/`Comments`, which alias `s.root`/`s.current` field slices (`AllFields`/`GetField` return the slice, no copy). A concurrent `update_settings`/comment on another connection appends/overwrites the same backing array → torn 24-byte slice header → out-of-bounds read/SIGSEGV (fatal). **Fix:** marshal the initial frame inside a locked method, or deep-copy `Fields`/`Comments` in `GenerateFullFrame`.
+
+**DR-3 — `Current().AllFields()` iterated outside the lock during mutation → torn read · High.** `Room.Current()` (`room.go:621`) returns a shallow copy whose embedded `fields.Fields` slice still aliases the live node; `logAfter` (`handlers.go:493`) then ranges `current.AllFields()` and `strings.Join(field.Values,…)` with `r.mu` released, while another client's mark/label command (`commands.go:153/172/194`) appends under the lock. **Fix:** deep-copy fields in `Current()`, or format inside a locked method.
+
+**DR-4 — `OGSConnector.Exit` read without a lock · Medium.** `End()` writes `o.Exit` under `o.mu` (`ogs.go:202`), but `loop()`/`readSocketToChan()` read it with no lock (`ogs.go:187,243`) — the author fixed the ping site with `isExited()` but missed these. **Fix:** use `isExited()` at both sites or make `Exit` an `atomic.Bool`. (`go test -race` on the shipped suite is clean because the tests don't exercise these concurrent paths.)
+
+### Deadlocks / lock-held-during-I/O
+
+**DL-2 — One slow reader freezes the whole room (and hub) · High · PoC `dl2`.** `Broadcast`/`SendTo`/`BroadcastHubMessage` (`room.go:361-392`) hold `r.mu` while calling `SendEvent` → `ws.Write` with no deadline. Reproduced: with one stuck-reading client, `r.Size()` (and thus every join/move/frame) blocks indefinitely. Escalation: `Hub.SendMessages` (`hub.go`) holds `h.mu` while broadcasting to every room, so a single stuck reader can stall the global message loop. **Fix:** snapshot the connection list under the lock, unlock, then write; add per-write deadlines and drop slow clients.
+
+**DL-1 — Hub freeze via `h.mu` held across room calls · High.** `ConnCount`/`RoomCount` (`hub.go:132`) lock `h.mu` and call `r.NumConns()` (which needs `r.mu`); if a broadcast has pinned some `r.mu` (DL-2), an unauthenticated `GET /api/stats` wedges while holding `h.mu`, and then every new WS (`GetOrCreateRoom`) and board load (`GetRoom`) blocks. **Fix:** never call room methods under `h.mu` — snapshot, release, then call.
+
+**DL-3 — `Room.Close` holds `r.mu` across `conn.Close` → room leak · Low.** `Close()` (`room.go:281`) writes a close frame to each connection under `r.mu`; a stalled client blocks it forever, so `Close` never returns and `DeleteRoom`/`db.DeleteRoom` never run — the room, its goroutines, and fds leak. **Fix:** snapshot and close outside the lock with a deadline.
+
+### Memory / goroutine / fd leaks
+
+**GL-1 — `Room.Close` never ends registered plugins · High.** `Close()` closes only `r.conns`, never iterates `r.plugins`/`p.End()`. On idle expiry the Heartbeat calls `Close` then `DeleteRoom`, after which no event can reach `closeOGS` — so the OGS `loop`/`ping`/`readSocketToChan` goroutines run forever, pinning the whole room object graph and a TCP fd. Drivable unauthenticated by minting rooms with an OGS plugin (`GET /ext/upload?url=…online-go.com/review/<id>` per request). **Fix:** iterate and `End()` all plugins in `Close()`; combine with the socket-close fix.
+
+**GL-2 — `readSocketToChan` blocks on a channel send after game-over · Medium.** When `loop()` returns on game-over, nothing drains `socketchan`; the next byte parks `readSocketToChan` on the unbuffered send (`ogs.go:185`), which the socket-close fix cannot interrupt. **Fix:** `select { case socketchan <- b: case <-done: return }`.
+
+**GL-3 — Postgres pool bounds unset · Low.** `SetMaxOpenConns`/`ConnMaxLifetime` are never set on the Postgres loader (the sqlite loader sets `SetMaxOpenConns(1)`); combined with per-room Heartbeat `DeleteRoom` running outside `h.mu`, mass room expiry can transiently spike connections. (Corrected from "leak" to transient exhaustion — `database/sql` closes idle conns by default.) **Fix:** set symmetric pool bounds.
+
+### Crypto / secrets
+
+**CS-1 — Postgres DSN logged in plaintext at startup · High.** `dbConfig.redact()` (`config.go:84`) is an empty no-op while `Config.Redact()` masks only Twitch, so `cmd/main.go:52` logs the running config including `DB.Path` — for Postgres, the DSN `postgres://user:pass@…` with the password. Requires log access, not remote. **Fix:** implement `dbConfig.redact()` (strip userinfo) or a `slog.LogValuer` that redacts.
+
+**CS-2 — Password > 72 bytes silently disables protection · Medium · PoC `cs2`.** bcrypt rejects inputs > 72 bytes with `ErrPasswordTooLong`; `core.Hash` (`verify.go:17`) discards the error and returns `""`. The guard is only `password != ""` (`handlers.go:313`), so a long password stores an empty hash → `HasPassword()==false` → the room is open to everyone while the owner believes it is protected (persists across restarts). Reproduced: `Hash(73×"A") == ""`. **Fix:** propagate the bcrypt error and reject the setting. (Room-name predictability from `math/rand` is tracked as L-8; the constant-time Twitch HMAC and, for ≤72-byte inputs, bcrypt usage are correct.)
+
+### Authorization / TOCTOU
+
+**AZ-1 — `/api/v1` trusts client `userid` → password-room takeover · High.** The WS path binds identity server-side (`evt.SetUser(ec.ID())`), but the HTTP handler (`apiv1router.go`) takes `evt.User()` verbatim from the attacker's JSON `userid` (`event.go:36`, `json:"userid"`) and never re-sets it. `authorized` checks `GetAuth(evt.User())`, and `connected_users` broadcasts every occupant's connection UUID — so an attacker idling in the room harvests an authenticated owner's UUID and replays it: `POST /api/v1/room/myroom {"event":"trash","userid":"<ownerUUID>"}` (or `update_settings`/`upload_sgf`). Full authz bypass on a **password-protected** room. **Fix:** never trust client `userid` as identity on the HTTP path; bind auth to server-issued tokens, not broadcast UUIDs.
+
+**AZ-2 — Enabling a password grandfathers all connected sockets · High.** `handleUpdateSettings` calls `SetAuthAll()` immediately before `SetPassword` (`handlers.go:330`), setting `auth[connID]=true` for every current connection — including a hostile one idling since the room was still open. Protection thus fails **open** for occupants present at set-time (and never evicts them; `auth` is never cleared), and combined with AZ-1 the attacker replays that grandfathered UUID indefinitely. **Fix:** clear `auth` in `SetPassword`; force re-`checkpassword`.
+
+**AZ-3 — `outsideBuffer` throttle keyed on client `userid` · Low.** The anti-flood gate compares `GetLastUser() != evt.User()`; on `/api/v1` the attacker controls `userid`, so pinning `lastUser` to their own id skips the throttle on subsequent privileged POSTs. It is a per-action throttle, not an authz control — an amplifier for the upload/OOM DoS. **Fix:** don't key throttling on client identity.
+
+**AZ-4 — `GetAuth` returns key-existence → revocation is a no-op · Low (latent).** `GetAuth` does `_, ok := r.auth[user]; return ok` (`room.go:204`), discarding the stored bool, so `SetAuth(id,false)` leaves the key and the user stays authorized. No live revocation path today, but a latent footgun. **Fix:** return the stored value.
+
+### Information disclosure
+
+**ID-1 — Password gates writes only; anyone reads a protected room · Medium.** `Handle` accepts any WS with no auth check and `RegisterConnection` immediately pushes `GenerateFullFrame(Full)`; `Broadcast` relays every move and `connected_users` (UUIDs) to all connections. `authorized` gates only mutating handlers, never the connect/read path — so an anonymous socket to a "protected" room receives the full board, every live move, and occupant UUIDs. **Fix:** gate the connect/read path if read-privacy is intended (and note this feeds AZ-1's UUID harvest).
+
+**ID-2 — Raw internal fetch/parser errors broadcast to clients · Medium.** `Fetch` returns the verbatim `*url.Error` (rewritten internal OGS API URL, resolved backend IP, local resolver `127.0.0.53:53`), wrapped into `ErrorEvent` and broadcast to every connection (`handlers.go:209/250`). Discloses internal request topology and gives an SSRF/liveness oracle (DNS-fail vs conn-refused vs parse-error are distinguishable). **Fix:** generic client messages; log details server-side only.
+
+**ID-3 — Hand-rolled JSON on `/api/v1` → JSON injection + infoleak · Medium.** `apiv1router.go` builds responses with `fmt.Sprintf(\`{"error":"%s"}\`, …)` interpolating the raw error/value (which for a failed `request_sgf` is a `*url.Error` containing quotes and `dial tcp <ip>:<port>`). The unescaped quotes break out of the JSON string (response injection) and leak internals. **Fix:** build a struct and `json.Marshal`; map errors to a generic message.
+
+**ID-4 — Allowlist-enumeration oracle + host reflection · Low.** `ApprovedFetch` returns `"unapproved URL. contact us to add <host>"` for a disallowed host vs a raw dial error for an allowed-but-unreachable one — a distinguisher that lets an attacker enumerate `okList` and reflects an arbitrary host into a client-visible broadcast. **Fix:** generic message, no host reflection.
+
+**ID-5 — Twitch OAuth callback echoes internal errors · Low.** `twitchrouter.go` returns `http.Error(w, err.Error(), 403)` on the state/exchange path, echoing internal client errors to the caller. **Fix:** generic messages.
+
+---
+
+## 7. Low findings / hardening
 
 - **L-1 — `GET /ext/upload` has side effects** (`pkg/hub/extrouter.go`): creates a room and triggers a server-side fetch → CSRF-able. Make it POST with CSRF protection.
 - **L-2 — Missing security headers** (`pkg/app/app.go`): no CSP/`X-Frame-Options`/`X-Content-Type-Options`/`Referrer-Policy`. Add a headers middleware (templates already auto-escape via `html/template`).
@@ -212,7 +299,7 @@ A class of type-assertion / index panics on attacker JSON that each **kill only 
 
 ---
 
-## 7. Not exploitable / mitigated
+## 8. Not exploitable / mitigated
 
 Documented so a re-audit does not re-raise them:
 - **Oversized board via NGF/SGF upload** — the NGF parser only stores `size` as a string; the sole path to `NewBoard` from parsed SGF/NGF is `state.FromSGF`, which **clamps `size > 19`** (`state.go:196`) and errors before allocating. Verified: `FromSGF("(;SZ[50000])")` → `"unsupported board size"`. (The unclamped board-size DoS is C-5, via `update_settings`.)
@@ -221,7 +308,7 @@ Documented so a re-audit does not re-raise them:
 
 ---
 
-## 8. Reviewed and clean (positives)
+## 9. Reviewed and clean (positives)
 
 - Passwords hashed with **bcrypt** and compared in constant time (`pkg/core/verify.go`).
 - **SQL fully parameterized** (`pkg/loader/dbloader.go`) — no injection. (Portability nit: `dbloader.go:382` uses double-quoted string literals that break on Postgres.)
@@ -232,23 +319,24 @@ Documented so a re-audit does not re-raise them:
 
 ---
 
-## 9. Remediation priority
+## 10. Remediation priority
 
-1. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (the delivery path).
-2. **Lock down the unauthenticated surface.** Authenticate/limit `POST /api/v1/room` + `MaxBytesReader` (C-7); add `authorized`+`outsideBuffer` to `graft` (H-6); validate `Origin` (H-1).
-3. **Bound resources.** Room/connection/rate caps + shorter heartbeat (H-2/H-3/M-6); WS message-size cap + read deadline (H-4); prune `auth`/`notified` maps (M-4); close the OGS socket in `End()` (H-8); node cap + incremental frames for graft (H-7).
-4. **Integrations & info leaks.** Fail-closed on empty Twitch secret + verify-before-challenge + replay protection (H-5/M-7); gate `/debug` (M-1); redirect-revalidating fetch client + egress `NetworkPolicy` (M-2).
-5. **Robustness & hardening.** Comma-ok all client-input assertions + escape `\` in serializers (M-10/M-5); Low items L-1…L-9; the deployment hardening implied by the K8s model (non-root, secrets, single-instance or shared state, egress policy).
+1. **Close the confirmed whole-server crashes.** Guard `Board.Set` + `recover()` in the OGS `loop` (C-1); add `len(spl)!=2` at `frame.go:131` + validate `LB` in `FromSGF` (C-2); depth-cap `parseBranch` and `toSGF`/`Copy` (C-3/C-4); cap board size (C-5) and zip output/entry count (C-6); cap the `upload_sgf` **array branch** (C-7); make `Nicks()` return a copy so `/api/v1` can't race the live map (DR-1).
+2. **Fix the concurrency model.** Never hold `r.mu`/`h.mu` across a socket write — snapshot connections, unlock, then write; add per-write deadlines and drop slow clients (DL-1/DL-2/DL-3). Deep-copy field slices marshaled outside the lock (DR-2/DR-3); atomic/locked `OGSConnector.Exit` (DR-4).
+3. **Fix authorization.** Stop trusting client `userid` on `/api/v1` — bind identity to a server-issued token (AZ-1/AZ-3); clear `auth` on `SetPassword` and re-require `checkpassword` (AZ-2); authenticate/limit `POST /api/v1/room` + `MaxBytesReader` (C-7); add `authorized`+`outsideBuffer` to `graft` (H-6); validate `Origin` (H-1).
+4. **Stop the leaks.** End plugins in `Room.Close` (GL-1) and fix the OGS channel-send/socket-close (GL-2/H-8); room/connection/rate caps + shorter heartbeat (H-2/H-3/M-6); prune `auth`/`notified` maps (M-4); Postgres pool bounds (GL-3).
+5. **Secrets, integrations & info leaks.** Implement `dbConfig.redact()` (CS-1) and propagate the bcrypt error (CS-2); fail-closed on empty Twitch secret + verify-before-challenge (H-5/M-7); gate `/debug` (M-1) and the read/connect path if rooms are meant to be private (ID-1); return generic error messages and `json.Marshal` responses (ID-2/ID-3/ID-4/ID-5); redirect-revalidating fetch client + egress `NetworkPolicy` (M-2).
+6. **Robustness & hardening.** Comma-ok all client-input assertions + escape `\` in serializers (M-10/M-5); Low items L-1…L-9; the deployment hardening implied by the K8s model (non-root, secrets, single-instance or shared state, egress policy).
 
 ---
 
-## 10. Running the PoCs
+## 11. Running the PoCs
 
 ```
 go build -o /tmp/board ./cmd && /tmp/board -f config/config-memory.yaml   # disposable target on :8080
 go run ./security/poc/harness <id> [-target localhost:8080]                # one id per finding
 ```
 
-Run with no arguments for the list. **Local-only** (no server): `c2 c5 c6 h6 h7 a1 b1 m4 m7`. **Need `-target`:** `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
+Run with no arguments for the list. **Local-only** (no server): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2`. **Need `-target`:** `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1`. Several PoCs crash or exhaust the target — **authorised local testing only**; see [`security/poc/README.md`](security/poc/README.md).
 
 *Caveats: line numbers reference the repository at assessment time; dynamic validation ran against the default in-memory config; items marked `insp.` are confirmed by code inspection rather than a runnable exploit.*

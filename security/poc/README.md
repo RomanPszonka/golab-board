@@ -17,8 +17,8 @@ go run ./security/poc/harness <id> [-target localhost:8080] [-origin url]
 
 Run with no arguments for the list.
 
-- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7` (`h6` verifies a *mitigation*).
-- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5`.
+- **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 m4 m7 dl2 cs2` (`h6` verifies a *mitigation*).
+- **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1`.
 - `b1` also runs end-to-end with `-target` (uploads the poison; then join the room to see it brick).
 
 ## Command → finding map
@@ -46,6 +46,9 @@ authoritative list and status).
 | `m5` | M-7 | Twitch challenge echoed before signature verification. |
 | `m2` | M-8 | Unbounded HTTP request body (server buffers 40 MB). |
 | `c1`,`c2`,`m7` | M-10 | Unchecked-input panics on the request path — **recovered** by net/http (per-connection). |
+| `dr1` | DR-1 | Concurrent map iteration+write on `r.nicks` via `/api/v1` → `fatal error: concurrent map …` (whole-server crash, not recoverable). |
+| `dl2` | DL-2 | One slow-reading client freezes the whole room (`r.mu` held across the blocking socket write). |
+| `cs2` | CS-2 | Password > 72 bytes → `bcrypt` errors, `Hash` returns `""` → room silently open. |
 | `h6` | (mitigation) | Verifies the `FromSGF` `size>19` clamp — the NGF/SGF board-OOM path is **not** exploitable. |
 
 Findings verified by code inspection only (no runnable command) — H-6, H-7, H-8,
