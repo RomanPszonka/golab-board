@@ -226,7 +226,7 @@ Every client is anonymous and can open a WebSocket, create rooms, upload files, 
 - **Location:** `pkg/room/plugin/ogs.go:358-437` (`gamedataToSGF`/`gameInfoToSGF`/`initStateToSGF`) and the loop reader `ogs.go:264-318`, all executed inside `go o.loop(...)` (`ogs.go:198`).
 - **Mechanism:** the connector converts **online-go.com-controlled JSON** into SGF using dozens of *unchecked* type assertions — `gamedata["width"].(float64)`, `players["black"].(map[string]any)`, `move[0].(float64)`, … — with no `, ok` guard. Any unexpected shape panics; because the panic is in a **plugin-spawned goroutine**, `net/http`'s recover does **not** catch it → whole-server crash (Critical-class when OGS is active — same boundary as C-1, distinct root cause).
 - **Attacker control:** the attacker chooses which OGS game/review the (open) room attaches to via an unauthenticated `request_sgf`. A **rengo (team) game** — public and common, where `players.black` is null or an array rather than `{username, rank}` — is enough; so is a game missing `width` or a truncated socket frame.
-- **Reproduced:** `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` feeds 10 attacker-reachable shapes to the conversion path — **all panic**; a well-formed 1v1 control does not. (End-to-end delivery needs live egress to online-go.com; the test reproduces the fatal panic deterministically without it.)
+- **Reproduced:** `go test -tags poc -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` feeds 10 attacker-reachable shapes to the conversion path — **all panic**; a well-formed 1v1 control does not. (End-to-end delivery needs live egress to online-go.com; the test reproduces the fatal panic deterministically without it.)
 - **Prod:** conditional on OGS egress; then crash → restart, repeatable.
 - **Fix:** comma-ok every assertion on OGS JSON and bail out on a mismatch; wrap `o.loop` in a `recover()` that tears the connector down; treat `ogs.go` as an untrusted-input parser.
 
@@ -429,7 +429,7 @@ go run ./security/poc/harness <id> [-target localhost:8080]                # one
 
 Run the harness with no arguments for the full command list. Other reproductions:
 - **Data races & the memory-loader crash:** `go test -race ./security/poc/race/` (DR-2/DR-3 and L-10).
-- **OGS gamedata crash (H-9):** `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/`.
+- **OGS gamedata crash (H-9):** `go test -tags poc -run TestOGSGamedataCrash_1c ./pkg/room/plugin/`.
 - **Pipeline fuzzing:** `go test -run x -fuzz FuzzSGFPipeline ./pkg/state/` drives the full `FromSGF → GenerateFullFrame → serialize → reload` path and finds the mark poison-pill in seconds. (The repo's parser-only fuzzers — `FuzzSGFParser`/`FuzzFromSGF` — never render or round-trip the tree, so they miss the poison class entirely; this target closes that gap.)
 - **Browser PoCs** (Node + Playwright + Chromium, server running): `node security/poc/browser/xss_label.js`, `xss_error_modal.js`, `xss_twitch_sniff.js`, `clickjacking.js`.
 

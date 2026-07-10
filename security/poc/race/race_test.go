@@ -1,5 +1,11 @@
+//go:build race
+
 // Package race reproduces the DR-2 / DR-3 data races (SECURITY_ASSESSMENT.md §6)
 // under the race detector: run `go test -race ./security/poc/race/`.
+//
+// Build-tagged `race` (like memoryloader_race_test.go) so these intentionally
+// concurrent tests compile and run ONLY under `-race`, never in a plain
+// `go test ./...`.
 //
 // These are torn-read races on tree field slices that are read outside r.mu
 // (marshaled / iterated) while another goroutine mutates them under r.mu.

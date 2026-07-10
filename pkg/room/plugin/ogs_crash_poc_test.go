@@ -1,3 +1,5 @@
+//go:build poc
+
 package plugin
 
 // Security PoC for SECURITY_ASSESSMENT.md finding 1c (High).
@@ -24,7 +26,12 @@ package plugin
 // deterministically without a live OGS socket. A well-formed 1v1 game is included
 // as a control (it must NOT panic).
 //
-//	go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/
+// Because it asserts that the vulnerability *reproduces*, it is build-tagged
+// `poc` so it is excluded from the default `go test ./...` — it only runs when
+// explicitly requested, and the normal suite stays green after the bug is fixed.
+// Run it with:
+//
+//	go test -tags poc -run TestOGSGamedataCrash_1c ./pkg/room/plugin/
 
 import "testing"
 

@@ -20,7 +20,7 @@ Run with no arguments for the list.
 - **Local-only** (no server needed): `c2 c5 c6 h6 h7 a1 b1 b2 copybomb sizepoison sgfquad m4 m7 dl2 cs2 graft grow gl1 dl1 az1 az2 cs1 nick authleak sgfesc id1` (`h6` verifies a *mitigation*).
 - **Need `-target`** (a live disposable instance): `c1 c3 c4 c7 h1 h2 h3 h4 h5 m2 m3 m5 dr1 id3`.
 - **Race detector** (separate): `go test -race ./security/poc/race/` reproduces DR-2/DR-3 and L-10 (the `MemoryLoader` concurrent-map crash — `TestL10`, `//go:build race` so it only runs under `-race`).
-- **Go test** (separate): `go test -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` reproduces H-9 (OGS gamedata assertion cascade).
+- **Go test** (separate): `go test -tags poc -run TestOGSGamedataCrash_1c ./pkg/room/plugin/` reproduces H-9 (OGS gamedata assertion cascade).
 - **Fuzzing** (separate): `go test -run x -fuzz FuzzSGFPipeline ./pkg/state/` drives the full `FromSGF → GenerateFullFrame → serialize → reload` pipeline and re-finds the C-2b mark poison-pill in seconds — the surface the parser-only fuzzers (`FuzzFromSGF`/`FuzzSGFParser`) never reach.
 - `b1`/`b2` also run end-to-end with `-target` (upload the poison; then join the room to see it brick).
 
