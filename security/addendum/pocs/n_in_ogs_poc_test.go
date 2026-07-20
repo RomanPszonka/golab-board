@@ -54,7 +54,7 @@ func TestNINFrameParserBracketsInStrings(t *testing.T) {
 	}
 
 	// 2. ']' inside a JSON string: frame terminates EARLY (mid-JSON).
-	bad2 := `["game/123/gamedata", {"game_name": "]]", "width": 19}]`
+	bad2 := `["game/123/gamedata", {"game_name": "]]]", "width": 19}]`
 	ch2 := feed(bad2)
 	d2, err2 := readFrameFromChan(ch2)
 	t.Logf("']' in string -> early return after %d of %d bytes (err=%v): %q", len(d2), len(bad2), err2, string(d2))
