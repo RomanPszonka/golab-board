@@ -1,5 +1,8 @@
 # Frontend (browser JS / templates) — NEW security findings
 
+> **Re-verification note:** consolidated + independently re-verified in [`SECURITY_ADDENDUM.md`](../../SECURITY_ADDENDUM.md); see its **§7** for corrections (notably N-2 downgraded to Low, and per-finding precondition/dedup caveats). Severities/IDs here are the per-area working notes.
+
+
 Scope: `pkg/frontend/js/**`, `pkg/frontend/html/**`, `pkg/frontend/embed.go`, plus
 `pkg/hub/webrouter.go` / `pkg/app/app.go` / the event-broadcast path only insofar as
 server data reaches the browser. Baseline: PR #2 head (`12030bc`). Exclusions honored:
@@ -53,12 +56,12 @@ out the owner. The password is also laid down in the DOM (`#settings-modal-passw
 value) and JS state of every observer's browser.
 
 ### PoC
-`/tmp/golab/pocs/nfe1_password_broadcast.py` (Python + `websockets`; the client
+`/tmp/golab/_pocs/nfe1_password_broadcast.py` (Python + `websockets`; the client
 protocol is a 4-byte LE length message followed by the JSON message):
 
 ```bash
 go build -o /tmp/board ./cmd && /tmp/board -f config/config-memory.yaml &   # :8080
-python3 /tmp/golab/pocs/nfe1_password_broadcast.py localhost:8080
+python3 /tmp/golab/_pocs/nfe1_password_broadcast.py localhost:8080
 ```
 
 The script connects an **observer** (never authenticates) and an **editor** that sets
@@ -132,10 +135,10 @@ property. `update_settings`-style sanitization does not exist anywhere on this p
   do not execute script, so this is honestly **Low**.
 
 ### PoC
-`/tmp/golab/pocs/nfe2_pen_css.js` (Node + Playwright, mirrors the repo's
+`/tmp/golab/_pocs/nfe2_pen_css.js` (Node + Playwright, mirrors the repo's
 `security/poc/browser/*.js` harness):
 ```bash
-node /tmp/golab/pocs/nfe2_pen_css.js http://localhost:8080
+node /tmp/golab/_pocs/nfe2_pen_css.js http://localhost:8080
 # [+] N-FE-2 pen-color CSS injection: CONFIRMED — path.style.stroke = url(//attacker.example/beacon.svg#p)
 ```
 The script injects the `draw` event via the unauthenticated API, then loads the board

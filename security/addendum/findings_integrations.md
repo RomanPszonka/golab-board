@@ -6,8 +6,16 @@ Scope: `pkg/room/plugin/{plugin.go,ogs.go}`, `internal/{twitch,fetch,zip}`, `pkg
 `loadtest/`, `integration/`, `go.mod` dependency review.
 
 All items below are **NEW** relative to `SECURITY_ASSESSMENT.md` (C-*, H-*, M-*, L-*, GL-*,
-DR-*, CS-*, ID-*, AZ-*, XSS-*). PoCs live in `/tmp/golab/pocs/` and are also present in-tree
-as `//go:build poc`-tagged tests (runnable with `go test -tags poc`).
+DR-*, CS-*, ID-*, AZ-*, XSS-*). PoCs are under `security/addendum/_pocs/` (copy into the
+named package, or `go test -tags poc`).
+
+> **Re-verification note:** the consolidated + independently re-verified report is
+> [`SECURITY_ADDENDUM.md`](../../SECURITY_ADDENDUM.md); see its **§7** for corrections. In
+> particular **N-IN-1 (= N-2) was downgraded High/Critical → Low**: the OGS injection is
+> **not reachable end-to-end** — the game-name payload must contain `]`, which N-IN-2 (= N-4)'s
+> frame parser truncates before `gameInfoToSGF` is ever called (both PoCs bypass that path by
+> calling `gamedataToSGF` directly). It remains a latent defect to fix alongside the N-4 fix.
+> N-IN-6 (= N-14, host-published Postgres) is gated behind the `monitoring` compose profile.
 
 ---
 
@@ -58,7 +66,7 @@ and reaches the frontend through full frames. The `TR[]` crash also fires in the
 goroutine — the escalation the report itself flags as Critical — but delivered remotely
 without any `upload_sgf`.
 
-**PoC (runnable).** `/tmp/golab/pocs/n_in_ogs_poc_test.go` → `TestNINSGFInjection`
+**PoC (runnable).** `/tmp/golab/_pocs/n_in_ogs_poc_test.go` → `TestNINSGFInjection`
 (copy into `pkg/room/plugin/`, `go test -tags poc -run TestNINSGFInjection -v ./pkg/room/plugin/`).
 Observed output:
 ```
@@ -115,7 +123,7 @@ is a distinct root cause — a hand-rolled framing parser that is not string-awa
 (`readFrameFromChan`, ogs.go:141-172) — with distinct effects (mis-framing, stall,
 retention) rather than assertion panics or socket blocking.
 
-**PoC (runnable).** `/tmp/golab/pocs/n_in_ogs_poc_test.go` → `TestNINFrameParserBracketsInStrings`.
+**PoC (runnable).** `/tmp/golab/_pocs/n_in_ogs_poc_test.go` → `TestNINFrameParserBracketsInStrings`.
 Observed:
 ```
 CONFIRMED: readFrameFromChan NEVER RETURNED for a frame with '[' in a string;
@@ -170,7 +178,7 @@ are *supposed* to be fetched, and the C-3/C-7 fixes as written (depth-cap parseB
 still open; cap the array branch) would leave this delivery wide open unless the fetch
 path is capped too.
 
-**PoC (runnable).** `/tmp/golab/pocs/n_in_requestsgf_poc_test.go` → `TestNINRequestSGFNoCap`
+**PoC (runnable).** `/tmp/golab/_pocs/n_in_requestsgf_poc_test.go` → `TestNINRequestSGFNoCap`
 (copy into `pkg/room/`, `go test -tags poc -run TestNINRequestSGFNoCap -v ./pkg/room/`).
 Uses the real `ApprovedFetch` + real `handleRequestSGF` chain with a stub HTTP client
 emulating the allow-listed host. Observed:
@@ -218,7 +226,7 @@ signature-verification bypass (unauthenticated forgery). This is a distinct auth
 omission in the handler itself (`twitchrouter.go:240`): with *valid* Twitch delivery and a
 *valid* secret, a non-broadcaster chatter is still authorized to mutate the room.
 
-**PoC (runnable).** `/tmp/golab/pocs/n_in_twitch_poc_test.go` → `TestNINTwitchBranchAuthz`
+**PoC (runnable).** `/tmp/golab/_pocs/n_in_twitch_poc_test.go` → `TestNINTwitchBranchAuthz`
 (copy into `pkg/hub/`, `go test -tags poc -run TestNINTwitchBranchAuthz -v ./pkg/hub/`).
 Observed:
 ```

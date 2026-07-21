@@ -1,5 +1,8 @@
 # NEW Findings — Parsers & Game-State Core (golab-board PR #2)
 
+> **Re-verification note:** consolidated + independently re-verified in [`SECURITY_ADDENDUM.md`](../../SECURITY_ADDENDUM.md); see its **§7** for corrections (notably N-2 downgraded to Low, and per-finding precondition/dedup caveats). Severities/IDs here are the per-area working notes.
+
+
 Audit scope: `pkg/core/parser/`, `pkg/core/tree|board|coord|fields|color`, `pkg/core/util.go`, `pkg/core/verify.go`, `pkg/state/`, `internal/zip`, `internal/sgfsamples`.
 Method: full read of every file + dynamic confirmation. All PoCs were executed against:
 (a) Go tests in `/tmp/golab/app/zz_poc/` (module-internal test package, run with `go test ./zz_poc/`), and
@@ -150,6 +153,6 @@ Every finding below is distinct from the exclusions (C-1..C-8, DR-*, DL-*, H-*, 
 
 ## Artifacts
 
-- PoC tests: `/tmp/golab/app/zz_poc/*.go` (run: `go test ./zz_poc/ -v`; left in place — test-only package, excluded from `go build`; also copied to `/tmp/golab/pocs/zz_poc/` and `/mnt/agents/output/pocs-core/`).
-- Live server used for E2E: `/tmp/golab/board -f /tmp/golab/pocs/config-core.yaml` (port 8094, memory DB). Left running.
+- PoC tests: `/tmp/golab/app/zz_poc/*.go` (run: `go test ./zz_poc/ -v`; left in place — test-only package, excluded from `go build`; also copied to `/tmp/golab/_pocs/zz_poc/` and `/mnt/agents/output/pocs-core/`).
+- Live server used for E2E: `/tmp/golab/board -f /tmp/golab/_pocs/config-core.yaml` (port 8094, memory DB). Left running.
 - Fuzz corpus: `zz_poc/testdata` (Go fuzz cache under the test package).

@@ -21,5 +21,8 @@ go build -o /tmp/board ./cmd && /tmp/board -f config/config-memory.yaml   # :808
 - `ogs_frame_parser_stall_test.go` — N-4 frame parser stall (same placement)
 - `n_in_requestsgf_poc_test.go` — N-3 uncapped request_sgf fetch → fatal stack overflow (copy into `pkg/room/`, `go test -tags poc -run TestNINRequestSGFNoCap -v ./pkg/room/`)
 - `n_in_twitch_poc_test.go` — N-12 Twitch !branch missing broadcaster check (copy into `pkg/hub/`, `go test -tags poc -run TestNINTwitchBranchAuthz -v ./pkg/hub/`)
+- `n2_reach_blocked_test.go` — **second-reviewer correction** for N-2: feeds a full `gamedata` frame through the *real* `readFrameFromChan` and shows the injection payload is truncated (N-4) before it reaches `gamedataToSGF` (copy into `pkg/room/plugin/`, `go test -run TestN2ReachabilityBlockedByN4 -v ./pkg/room/plugin/`). Contrast the N-2 PoCs above, which call `gamedataToSGF` directly and so only exercise the isolated conversion.
 
 Several PoCs crash or exhaust the target — authorized local testing only.
+
+> **Note:** this directory is named `_pocs` (underscore prefix) so the Go toolchain skips it in `go build/test ./...` — the files are not a single valid package (they target several packages for copy-in), and building them in place broke the module suite. Run each by copying into its target package (above) or, for the `main` programs, via `go run <file>` from inside this directory.

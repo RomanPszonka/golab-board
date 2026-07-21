@@ -1,7 +1,10 @@
 # Findings — Routes / HTTP / WebSocket layer (golab-board PR #2)
 
+> **Re-verification note:** consolidated + independently re-verified in [`SECURITY_ADDENDUM.md`](../../SECURITY_ADDENDUM.md); see its **§7** for corrections (notably N-2 downgraded to Low, and per-finding precondition/dedup caveats). Severities/IDs here are the per-area working notes.
+
+
 **Auditor scope:** `pkg/hub/*`, `pkg/room/{room,handlers}.go`, `pkg/event/*`, `pkg/config/config.go`, `pkg/app/app.go`, `cmd/main.go` (+ `internal/fetch`, `internal/twitch`, `pkg/logx`, `pkg/message` read for context).
-**Method:** full white-box read + dynamic validation against a locally built server (`go build ./cmd`, run with memory config on :8093) using `curl` and purpose-built Go WebSocket clients (`/tmp/golab/pocs/`).
+**Method:** full white-box read + dynamic validation against a locally built server (`go build ./cmd`, run with memory config on :8093) using `curl` and purpose-built Go WebSocket clients (`/tmp/golab/_pocs/`).
 **Exclusions cross-checked against:** `SECURITY_ASSESSMENT.md` in the PR (C-*, H-*, DR-*, DL-*, AZ-*, GL-*, ID-*, M-*, L-*, CS-*, XSS-*, CJ-1). Only genuinely distinct issues are reported.
 
 ---
@@ -18,9 +21,9 @@
   3. The attacker receives:
      `{"event":"update_settings","value":{...,"password":"hunter2",...},"userid":"<ownerUUID>",...}` (captured verbatim; PoC below).
 - **Impact:** Complete disclosure of the room's only credential to any anonymous occupant, at the exact moment the owner believes they are locking the room down. Worse than AZ-2 (grandfathered sockets) — and **defeats AZ-2's suggested fix**: even if `auth` were cleared on `SetPassword`, the attacker simply re-authenticates with the leaked password (from any device, and can share it). The leak also *repeats*: the stock client stores the received password (`state.js:191`, `set_password()` puts it back into the password bar), so every subsequent settings change by any client re-broadcasts it. It also self-propagates to every connected client's `state.password`.
-- **PoC:** `/tmp/golab/pocs/passleak/main.go` (two WS connections; owner sends `update_settings` with `password:"hunter2"`; attacker prints the broadcast). Observed output:
+- **PoC:** `/tmp/golab/_pocs/passleak/main.go` (two WS connections; owner sends `update_settings` with `password:"hunter2"`; attacker prints the broadcast). Observed output:
   `[attacker] sees: {"event":"update_settings","value":{"black":"b","buffer":250,"komi":"6.5","nickname":"owner","password":"hunter2","size":19,"white":"w"},...}`
-  API vector: `curl -XPOST localhost:8093/api/v1/room/apivect2 -d '{"event":"update_settings","value":{...,"password":"s3cr3t-api",...},"userid":"api-caller"}'` while a WS listener (`/tmp/golab/pocs/wslisten`) idles in `apivect2` → listener receives `"password":"s3cr3t-api"`.
+  API vector: `curl -XPOST localhost:8093/api/v1/room/apivect2 -d '{"event":"update_settings","value":{...,"password":"s3cr3t-api",...},"userid":"api-caller"}'` while a WS listener (`/tmp/golab/_pocs/wslisten`) idles in `apivect2` → listener receives `"password":"s3cr3t-api"`.
 - **Why not a duplicate:** AZ-2 is stale `auth` map entries (same-file but different mechanism: authorization state, not data disclosure; its fix — clearing `auth` — does nothing here). ID-1 covers read-access to board state, not credential disclosure. No exclusion covers event-payload sanitization before broadcast.
 - **Suggested fix:** In `handleUpdateSettings`, delete/blank `sMap["password"]` (and rebuild the outbound event) before returning, e.g. return a `NewEvent("update_settings", sanitizedMap)`; never broadcast client-supplied secrets.
 
@@ -33,7 +36,7 @@
   - `ws://host/socket/b/alpha?x=1` and `?x=2` create **separate** rooms `alphax1`, `alphax2` (plus `alpha` itself): `/api/stats` showed 3 rooms for one board name.
   - Absolute-form: `curl --request-target "http://attacker.example/socket/b/absform" <upgrade headers>` → HTTP 101 and a new room **`attackerexample`** (authority text!), confirmed via `/b/attackerexample/debug`.
 - **Impact:** Room-space multiplication for a single board name (amplifies the unbounded-room-creation issue H-2 beyond distinct names); room-identity confusion — two clients who believe they are on the same board (`/socket/b/x?a` vs `/socket/b/x?b`) are in different rooms; identity can be driven by arbitrary authority/query text, which proxies may forward or log differently than the app.
-- **PoC:** commands above; client: `/tmp/golab/pocs/wsclient` (dial with query), curl with `--request-target` for absolute-form.
+- **PoC:** commands above; client: `/tmp/golab/_pocs/wsclient` (dial with query), curl with `--request-target` for absolute-form.
 - **Why not a duplicate:** H-2 is "any new boardID creates a room" (no cap). This is a different root cause — the WS handler *mis-parses its own route* (path vs query vs authority), which H-2's fix (a room cap) would not address: the split/confusion remains.
 - **Suggested fix:** Pass chi's `URLParam(r,"boardID")` through to `Handler` (e.g. wrap the `websocket.Handler` per-request) instead of re-parsing `URL.String()`; at minimum, parse with `url.Parse` and use only the path segment.
 
