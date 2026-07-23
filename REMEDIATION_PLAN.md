@@ -76,8 +76,8 @@ connection/room counts, fetch size. **Closes:** C-3, C-4, C-5, C-6, C-8, H-2, H-
 M-11, M-12, N-3.
 
 - [ ] Depth-cap `parseBranch` (`pkg/core/parser/sgfparser.go:214`) — error past ~1000 nesting — or
-  rewrite iteratively. (C-3)
-- [ ] Depth-cap or iteratively rewrite `SGFNode.toSGF` / `TreeNode.Copy` (serialize path via
+  convert it to an iterative implementation. (C-3)
+- [ ] Depth-cap or convert `SGFNode.toSGF` / `TreeNode.Copy` to iterative (serialize path via
   `parser.Merge`). (C-4)
 - [ ] Validate board size to a whitelist (`{9,13,19}`) in `handleUpdateSettings`
   (`pkg/room/handlers.go`) **and** clamp defensively in `NewBoard` (`pkg/core/board/board.go:61`);
@@ -142,7 +142,7 @@ N-2, N-4, N-6, N-8.
 shared slices are marshaled without copying. **Closes:** DL-1, DL-2, DL-3, DR-1, DR-2, DR-3, DR-4,
 L-10.
 
-- [ ] Rewrite `Broadcast`/`SendTo`/`BroadcastHubMessage` (`pkg/room/room.go:361…`): **snapshot** the
+- [ ] Restructure `Broadcast`/`SendTo`/`BroadcastHubMessage` (`pkg/room/room.go:361…`): **snapshot** the
   connection list under `r.mu`, **unlock**, then write — with a per-write deadline and drop of slow
   clients. (DL-2, DL-3)
 - [ ] Never call room methods (`r.NumConns()` etc.) while holding `h.mu` in the hub
@@ -296,10 +296,10 @@ Keep `go build/vet/test ./...` green throughout (it is green at the current head
 
 ## Reassessment (the honest bottom line)
 
-- **Fix, don't rewrite.** Six of the seven gaps are bounded, known-pattern, and verifiable against
-  the existing PoCs. The valuable, hard-to-replicate part — the go-game / SGF / tree-state logic —
-  is where **none** of the bugs live; a rewrite would risk exactly that and reproduce the
-  design-class gaps in a new language.
+- **The work is bounded and mechanical.** Six of the seven gaps are known-pattern fixes, verifiable
+  against the existing PoCs. The valuable, hard-to-replicate part — the go-game / SGF / tree-state
+  logic — is where **none** of the bugs live; the fixes are concentrated in the input-handling and
+  deployment layers, which are the well-understood parts.
 - **Effort:** hardening everything *except* real auth ≈ **1–1.5 focused weeks** for one competent Go
   dev, including testing. Real auth (G5-full) adds **1–3 weeks** and is the only place worth pricing
   an alternative.
