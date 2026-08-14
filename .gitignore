@@ -8,3 +8,6 @@ testdata/
 tmp/
 config.yaml
 logs/
+
+# stray go-build output of the security PoC harness (use `go run` instead)
+/harness
